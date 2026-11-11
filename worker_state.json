@@ -3,7 +3,7 @@
   "sleep_start_hour": 0,
   "sleep_end_hour": 7,
   "backup_chat_id": "30956754",
-  "backup_last_update_id": 603239682,
+  "backup_last_update_id": 603239691,
   "last_insta_publish_ts": 1794424056.7971766,
   "daily_stats": {
     "date": "۲۰۲۶/۱۱/۱۱",
@@ -11,5 +11,5 @@
     "stories": 11,
     "posts": 0
   },
-  "last_midnight_dump_date": "2026-11-10"
+  "last_midnight_dump_date": "2026-11-12"
 }
