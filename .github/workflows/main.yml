@@ -2,8 +2,8 @@ name: Instagram Publisher
 
 on:
   schedule:
-    # اجرای پیوسته ۲۴ ساعته (رایگان در مخزن Public)
-    - cron: '*/20 * * * *'
+    # اجرای پیوسته هر ۲۵ دقیقه (هر نوبت ۲۴ دقیقه فعال است تا هیچ نوبتی در حالت Waiting نماند)
+    - cron: '*/25 * * * *'
   workflow_dispatch:
     inputs:
       dump_queue_now:
@@ -18,7 +18,7 @@ on:
 
 concurrency:
   group: shiraz-insta-always-on
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 permissions:
   contents: write
@@ -26,7 +26,7 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-24.04
-    timeout-minutes: 65
+    timeout-minutes: 30
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -74,7 +74,7 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python insta_worker.py
 
-      - name: Encrypt Session & Push Clean History
+      - name: Encrypt Session & Save State Safely
         if: always()
         env:
           STATE_PASS: ${{ secrets.STATE_PASS }}
@@ -94,8 +94,7 @@ jobs:
           git config --global user.name "InstaWorker"
           git config --global user.email "bot@noreply.github.com"
 
-          git checkout --orphan clean_latest
-          git add -A
-          git commit -m "Update encrypted insta state"
-          git branch -M clean_latest main
-          git push -f origin main || true
+          git add insta_session.json.enc device_uuids.json.enc published_tasks.json worker_state.json || true
+          git diff --staged --quiet || git commit -m "Update encrypted insta state"
+          git pull --rebase -X ours origin main || true
+          git push origin main || true
