@@ -1,0 +1,101 @@
+name: Instagram Publisher
+
+on:
+  schedule:
+    # اجرای پیوسته ۲۴ ساعته (رایگان در مخزن Public)
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+    inputs:
+      dump_queue_now:
+        description: 'تحویل فوری فایل‌ها به ربات تلگرام؟ (yes/no)'
+        required: false
+        default: 'no'
+      clear_queue:
+        description: 'پاکسازی صف؟ (yes/no)'
+        required: false
+        default: 'no'
+  repository_dispatch:
+
+concurrency:
+  group: shiraz-insta-always-on
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Decrypt Session & UUIDs
+        env:
+          STATE_PASS: ${{ secrets.STATE_PASS }}
+        run: |
+          if [ -n "$STATE_PASS" ]; then
+            if [ -f insta_session.json.enc ]; then
+              openssl enc -d -aes-256-cbc -pbkdf2 -in insta_session.json.enc -out insta_session.json -pass env:STATE_PASS || true
+            fi
+            if [ -f device_uuids.json.enc ]; then
+              openssl enc -d -aes-256-cbc -pbkdf2 -in device_uuids.json.enc -out device_uuids.json -pass env:STATE_PASS || true
+            fi
+          fi
+
+      - name: Fetch ready graphics from Public Repo
+        run: |
+          rm -rf public_data
+          git clone --depth 1 https://github.com/arpparnian-arch/shirazlastnewsbot.git public_data
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg & Libraries (Fail-Safe Mode)
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout="10" update || true
+            sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout="10" install -y ffmpeg || true
+          fi
+          pip install --upgrade pip
+          pip install --upgrade pyTelegramBotAPI requests Pillow instagrapi moviepy imageio-ffmpeg
+
+      - name: Run Instagram Worker (Always-On)
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          BACKUP_BOT_TOKEN: ${{ secrets.BACKUP_BOT_TOKEN }}
+          IG_SESSIONID: ${{ secrets.IG_SESSIONID }}
+          INSTA_PASS: ${{ secrets.INSTA_PASS }}
+          DUMP_QUEUE_NOW: ${{ github.event.inputs.dump_queue_now }}
+          CLEAR_QUEUE: ${{ github.event.inputs.clear_queue }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python insta_worker.py
+
+      - name: Encrypt Session & Push Clean History
+        if: always()
+        env:
+          STATE_PASS: ${{ secrets.STATE_PASS }}
+        run: |
+          rm -rf public_data
+          if [ -n "$STATE_PASS" ]; then
+            if [ -f insta_session.json ]; then
+              openssl enc -aes-256-cbc -pbkdf2 -salt -in insta_session.json -out insta_session.json.enc -pass env:STATE_PASS
+            fi
+            if [ -f device_uuids.json ]; then
+              openssl enc -aes-256-cbc -pbkdf2 -salt -in device_uuids.json -out device_uuids.json.enc -pass env:STATE_PASS
+            fi
+          fi
+          rm -f insta_session.json device_uuids.json
+          touch published_tasks.json worker_state.json
+
+          git config --global user.name "InstaWorker"
+          git config --global user.email "bot@noreply.github.com"
+
+          git checkout --orphan clean_latest
+          git add -A
+          git commit -m "Update encrypted insta state"
+          git branch -M clean_latest main
+          git push -f origin main || true
