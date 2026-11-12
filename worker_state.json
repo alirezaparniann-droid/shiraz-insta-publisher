@@ -3,17 +3,17 @@
   "sleep_start_hour": 0,
   "sleep_end_hour": 7,
   "backup_chat_id": "30956754",
-  "backup_last_update_id": 603239760,
-  "last_insta_publish_ts": 1794509130.8527555,
-  "last_env_sid_hash": "277164f1fca7304c829fd68eb4ea1716",
-  "active_sessionid": "56014548029:zPlb4FlPcl2dlE:4:AYlN_X_NZPMQPckI3pNm2aDWkLvw_gsDSVYTzr5xEw",
+  "backup_last_update_id": 603239771,
+  "last_insta_publish_ts": 1794513072.1245437,
+  "last_env_sid_hash": "902081ed09bd84562bfbfb004dcb1f4e",
+  "active_sessionid": "56014548029:Ui5YdbtvWkuj1l:9:AYlM157BzhCxAToqT9zNYbTI2lW3wnK93vBkEctvEQ",
   "vip_task_ids": [],
   "story_override_ids": [],
   "custom_captions": {},
   "daily_stats": {
     "date": "۲۰۲۶/۱۱/۱۲",
     "reels": 13,
-    "stories": 13,
+    "stories": 14,
     "posts": 1
   },
   "last_midnight_dump_date": "2026-11-12"
