@@ -25,7 +25,7 @@ from telebot.types import (
 )
 from instagrapi import Client
 
-# ۱. پچ سازگاری Pillow برای جلوگیری از خطای moviepy هنگام آپلود Reels
+# پچ سازگاری Pillow برای رندر بدون خطای ویدیوهای Reels در moviepy
 if not hasattr(Image, "ANTIALIAS"):
     Image.ANTIALIAS = getattr(Image, "Resampling", Image).LANCZOS
 
@@ -40,7 +40,7 @@ except Exception:
     HAS_STORY_POLL = False
 
 # ==========================================
-# ۱. تنظیمات پایه و توکن‌ها (حفظ کامل اتصال و سشن قفل‌شده)
+# ۱. تنظیمات پایه و زمان‌بندی (۲۴ ساعته برای تلگرام + چرخه ۶۰ دقیقه‌ای اینستاگرام)
 # ==========================================
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 BACKUP_BOT_TOKEN = os.environ.get("BACKUP_BOT_TOKEN", "").strip()
@@ -60,15 +60,17 @@ STATE_FILE = "worker_state.json"
 QUEUE_FILE = "public_data/drafts/insta_queue.json"
 PUBLIC_REPO_URL = "https://github.com/arpparnian-arch/shirazlastnewsbot.git"
 
+# زمان‌بندی دقیق انتشار در اینستاگرام: هر ۶۰ دقیقه حداکثر ۲ مورد (در ساعات ۷ صبح تا ۱۲ شب)
 MAX_ITEMS_PER_RUN = 2
-# چرخه ۶۱ دقیقه‌ای انتشار در اینستاگرام
-CYCLE_MINUTES = 61
-# اجرای پیوسته ۲۴ دقیقه‌ای هماهنگ با کرون ۲۵ دقیقه‌ای گیت‌هاب
-LOOP_DURATION_SECONDS = 24 * 60
+CYCLE_MINUTES = 60
+
+# مدت زمان روشن ماندن هر نوبت (۵۵ دقیقه) با تحویل خودکار شیفت به نوبت بعدی بدون ۱ ثانیه قطعی
+LOOP_DURATION_SECONDS = 55 * 60
 
 STATE_LOCK = threading.Lock()
 GIT_LOCK = threading.Lock()
 KEEP_RUNNING = True
+PROCESS_START_TS = time.time()
 
 # ربات اول (@shirazlastnews_bot): مخصوص گزارش‌های انتشار اینستاگرام
 bot = telebot.TeleBot(TOKEN, threaded=False) if TOKEN else None
@@ -98,6 +100,9 @@ def load_worker_state():
         "last_insta_publish_ts": 0,
         "last_env_sid_hash": "",
         "active_sessionid": "",
+        "vip_task_ids": [],
+        "story_override_ids": [],
+        "custom_captions": {},
         "daily_stats": {"date": "", "reels": 0, "stories": 0, "posts": 0}
     }
     with STATE_LOCK:
@@ -141,6 +146,42 @@ def save_published_list(pub_list):
             pass
 
 
+def sync_state_to_github():
+    """ذخیره آنی وضعیت صف، سشن و تنظیمات در گیت‌هاب در حین اجرا"""
+    def _bg_push():
+        with GIT_LOCK:
+            try:
+                state_pass = os.environ.get("STATE_PASS", "").strip()
+                if state_pass:
+                    if os.path.exists(SESSION_FILE):
+                        subprocess.run(
+                            ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt",
+                             "-in", SESSION_FILE, "-out", f"{SESSION_FILE}.enc", "-pass", "env:STATE_PASS"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10
+                        )
+                    if os.path.exists(UUIDS_FILE):
+                        subprocess.run(
+                            ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt",
+                             "-in", UUIDS_FILE, "-out", f"{UUIDS_FILE}.enc", "-pass", "env:STATE_PASS"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10
+                        )
+                subprocess.run(["git", "config", "user.name", "InstaWorker"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["git", "config", "user.email", "bot@noreply.github.com"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(
+                    ["git", "add", "insta_session.json.enc", "device_uuids.json.enc", PUBLISHED_FILE, STATE_FILE],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                diff_res = subprocess.run(["git", "diff", "--staged", "--quiet"])
+                if diff_res.returncode != 0:
+                    subprocess.run(["git", "commit", "-m", "Live state sync"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["git", "pull", "--rebase", "-X", "ours", "origin", "main"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                    subprocess.run(["git", "push", "origin", "main"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+            except Exception as e:
+                print("Live state sync notice:", e)
+
+    threading.Thread(target=_bg_push, daemon=True).start()
+
+
 def refresh_public_data():
     with GIT_LOCK:
         try:
@@ -166,6 +207,7 @@ def refresh_public_data():
 
 
 def get_backup_kb(auto_enabled=True):
+    """کیبورد کامل ۹ فرمان مدیریتی در ربات @newswriting1_bot"""
     mk = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     mk.add(
         KeyboardButton("📥 دریافت همه موارد باقی‌مانده"),
@@ -226,7 +268,6 @@ def notify_backup_bot(msg, with_kb=True):
 # ==========================================
 # ۲. پچ حذف خطای 404 (qe/expose) و قفل دائمی هدر و کوکی سشن
 # ==========================================
-# غیرفعال کردن مستقیم متد منقضی‌شده expose در کتابخانه instagrapi
 Client.expose = lambda self, *args, **kwargs: {"status": "ok"}
 
 _orig_send_private_request = getattr(Client, "_send_private_request", None)
@@ -234,7 +275,6 @@ _orig_send_private_request = getattr(Client, "_send_private_request", None)
 
 def _patched_send_private_request(self, endpoint, *args, **kwargs):
     ep_str = str(endpoint).strip()
-    # جلوگیری از ارسال درخواست به آدرس حذف‌شده qe/expose/ که باعث خطای 404 می‌شد
     if "qe/expose" in ep_str or "launcher/sync" in ep_str:
         return {"status": "ok"}
 
@@ -253,12 +293,10 @@ def _patched_send_private_request(self, endpoint, *args, **kwargs):
     try:
         return _orig_send_private_request(self, endpoint, *args, **kwargs)
     except Exception as exc:
-        # اگر هر آدرس فرعی همگام‌سازی خطای 404 داد، مانع توقف آپلود شو
-        if "404" in str(exc) and any(x in ep_str for x in ["qe/", "zr/", "launcher/", " attribution"]):
+        if "404" in str(exc) and any(x in ep_str for x in ["qe/", "zr/", "launcher/", "attribution"]):
             return {"status": "ok"}
         raise exc
     finally:
-        # حفظ قفل سشن در صورت ارسال هدر خالی توسط اینستاگرام بعد از آپلود
         if locked_bearer and locked_auth:
             cur_auth = getattr(self, "authorization_data", None) or {}
             if not cur_auth.get("sessionid"):
@@ -285,6 +323,7 @@ def activate_safety_cooldown(hours=3, reason=""):
     st["cooldown_until"] = time.time() + (hours * 3600)
     st["reason"] = reason
     save_worker_state(st)
+    sync_state_to_github()
 
 
 def clear_safety_cooldown():
@@ -463,7 +502,7 @@ def get_insta_client():
 
 
 # ==========================================
-# ۳. توابع آپلود مدیا (استانداردسازی کامل برای Reels، Story و Post)
+# ۳. توابع آپلود مدیا (اولویت‌بندی: ۱. ریلز -> ۲. استوری -> ۳. پست)
 # ==========================================
 def get_task_priority(task_type):
     t = str(task_type).lower().strip()
@@ -496,7 +535,7 @@ def make_clean_cover_thumb(video_path):
 
 
 def ensure_reel_compatible_video(video_path):
-    """تضمین استاندارد بودن کدک تصویر و صدای ویدیو برای بخش Reels اینستاگرام"""
+    """استانداردسازی ویدیو برای آپلود تضمینی در بخش Reels اینستاگرام"""
     fixed_path = str(video_path) + "_reel_ready.mp4"
     try:
         res = subprocess.run(
@@ -562,6 +601,11 @@ def get_current_pending_tasks(published):
     except Exception:
         return []
 
+    st = load_worker_state()
+    vip_ids = set(st.get("vip_task_ids", []))
+    story_overrides = set(st.get("story_override_ids", []))
+    custom_caps = st.get("custom_captions", {})
+
     now_ts = int(time.time())
     MAX_AGE_SECONDS = 18 * 3600
     pending_tasks = []
@@ -573,18 +617,28 @@ def get_current_pending_tasks(published):
         if task_id in published:
             continue
 
-        task_time = int(task.get("time") or 0)
-        if not task.get("vip") and task_time > 0 and (now_ts - task_time) > MAX_AGE_SECONDS:
+        t_copy = dict(task)
+        if task_id in vip_ids:
+            t_copy["vip"] = True
+        if task_id in story_overrides:
+            cur_t = str(t_copy.get("type", "")).lower()
+            t_copy["type"] = "story_video" if cur_t in ("reel", "video") else "story_photo"
+        if task_id in custom_caps:
+            t_copy["caption"] = custom_caps[task_id]
+
+        task_time = int(t_copy.get("time") or 0)
+        if not t_copy.get("vip") and task_time > 0 and (now_ts - task_time) > MAX_AGE_SECONDS:
             published.append(task_id)
             modified_pub = True
             continue
 
-        pending_tasks.append((task_id, task))
+        pending_tasks.append((task_id, t_copy))
 
     if modified_pub:
         save_published_list(published)
 
-    pending_tasks.sort(key=lambda item: get_task_priority(item[1].get("type", "")))
+    # اولویت با موارد VIP و سپس: ۱. ریلز -> ۲. استوری -> ۳. پست
+    pending_tasks.sort(key=lambda item: (0 if item[1].get("vip") else 1, get_task_priority(item[1].get("type", ""))))
     return pending_tasks
 
 
@@ -603,7 +657,7 @@ def deliver_tasks_to_telegram(tasks_to_send, published_list, title_header="تخ�
     if not tasks_to_send:
         notify_backup_bot(
             f"✅ <b>گزارش ({title_header} | ساعت {time_str}):</b>\n"
-            f"در حال حاضر هیچ فایل منتشرنشده‌ای در صف نیست."
+            f"در حال حاضر هیچ فایل منتشرنشده‌ای در این بخش وجود ندارد."
         )
         return 0
 
@@ -751,6 +805,7 @@ def deliver_tasks_to_telegram(tasks_to_send, published_list, title_header="تخ�
             print(f"Error delivering task {idx}:", e)
 
     save_published_list(published_list)
+    sync_state_to_github()
     notify_backup_bot(f"✅ <b>ارسال کامل شد! مجموعاً {to_persian_num(sent_count)} مورد تحویل گردید.</b>")
     return sent_count
 
@@ -775,7 +830,7 @@ def execute_manual_dump_action(user_action, published):
 
 
 # ==========================================
-# ۵. نخ اختصاصی ربات دوم تلگرام (@newswriting1_bot)
+# ۵. نخ اختصاصی ۲۴ ساعته ربات دوم تلگرام (@newswriting1_bot) - پشتیبانی کامل از ۹ فرمان
 # ==========================================
 def process_single_telegram_update(u, published):
     if not listener_bot:
@@ -816,9 +871,38 @@ def process_single_telegram_update(u, published):
             if target_hash not in published:
                 published.append(target_hash)
                 save_published_list(published)
+                sync_state_to_github()
             try:
                 listener_bot.answer_callback_query(cq.id, "🗑 آیتم از صف حذف گردید.")
                 listener_bot.edit_message_text("✅ این آیتم از صف انتشار اینستاگرام حذف شد.", cid, mid)
+            except Exception:
+                pass
+
+        elif data.startswith("q_top|"):
+            target_hash = data.split("|")[1]
+            vips = st.get("vip_task_ids", [])
+            if target_hash not in vips:
+                vips.append(target_hash)
+                st["vip_task_ids"] = vips[-100:]
+                save_worker_state(st)
+                sync_state_to_github()
+            try:
+                listener_bot.answer_callback_query(cq.id, "⚡️ به صدر اولویت صف منتقل شد!")
+                listener_bot.send_message(cid, "✅ آیتم انتخابی با اولویت VIP در صدر صف قرار گرفت.")
+            except Exception:
+                pass
+
+        elif data.startswith("q_tostory|"):
+            target_hash = data.split("|")[1]
+            st_list = st.get("story_override_ids", [])
+            if target_hash not in st_list:
+                st_list.append(target_hash)
+                st["story_override_ids"] = st_list[-100:]
+                save_worker_state(st)
+                sync_state_to_github()
+            try:
+                listener_bot.answer_callback_query(cq.id, "📱 به استوری تبدیل شد.")
+                listener_bot.send_message(cid, "✅ نوع این آیتم به «فقط استوری» تغییر یافت.")
             except Exception:
                 pass
 
@@ -842,6 +926,20 @@ def process_single_telegram_update(u, published):
             st["backup_chat_id"] = cid
             save_worker_state(st)
 
+        # امکان ویرایش کپشن با ریپلای روی پیام‌های لیست ۵ مورد اول صف
+        if u.message.reply_to_message and u.message.reply_to_message.text:
+            rep_txt = u.message.reply_to_message.text
+            m_hash = re.search(r"ID:\s*([a-f0-9]{8,32})", rep_txt)
+            if m_hash and raw_txt:
+                t_hash = m_hash.group(1).strip()
+                c_caps = st.get("custom_captions", {})
+                c_caps[t_hash] = raw_txt
+                st["custom_captions"] = c_caps
+                save_worker_state(st)
+                sync_state_to_github()
+                listener_bot.send_message(cid, "✅ کپشن این آیتم در صف اینستاگرام با موفقیت ویرایش شد.")
+                return
+
         if raw_txt.startswith("سشن:") or raw_txt.startswith("/session") or ("56014548029" in raw_txt and (":" in raw_txt or "%3A" in raw_txt)):
             raw_sid = raw_txt.replace("سشن:", "").replace("/session", "").strip()
             cl_test = Client()
@@ -851,6 +949,7 @@ def process_single_telegram_update(u, published):
                 save_worker_state(st)
                 save_valid_session(cl_test, fallback_sid=clean_s)
                 clear_safety_cooldown()
+                sync_state_to_github()
                 listener_bot.send_message(
                     cid,
                     "✅ <b>سشن جدید اینستاگرام با موفقیت ثبت و قفل شد!</b>",
@@ -868,6 +967,7 @@ def process_single_telegram_update(u, published):
                 st["sleep_start_hour"] = int(nums[0]) % 24
                 st["sleep_end_hour"] = int(nums[1]) % 24
                 save_worker_state(st)
+                sync_state_to_github()
                 listener_bot.send_message(
                     cid,
                     f"✅ ساعت خاموشی شبانه روی <b>{to_persian_num(st['sleep_start_hour'])} تا {to_persian_num(st['sleep_end_hour'])} صبح</b> تنظیم شد.",
@@ -879,15 +979,17 @@ def process_single_telegram_update(u, published):
         if txt in ("/start", "/menu", "منو", "شروع"):
             listener_bot.send_message(
                 cid,
-                "👋 <b>ربات مدیریت و تحویل فایل‌های اینستاگرام فعال است! (پاسخگویی آنی ۲۴ ساعته ⚡️)</b>\n\n"
-                "از دکمه‌های زیر می‌توانید در هر لحظه برای مدیریت صف و تحویل فایل‌ها استفاده کنید:",
+                "👋 <b>ربات مدیریت و تحویل فایل‌های اینستاگرام ۲۴ ساعته فعال است! ⚡️</b>\n\n"
+                "از ۹ فرمان زیر می‌توانید در هر ساعت از شبانه‌روز استفاده کنید:",
                 parse_mode="HTML",
                 reply_markup=get_backup_kb(st.get("auto_upload_enabled", True))
             )
 
+        # فرمان ۷: توقف / فعال‌سازی آپلود خودکار پیج
         elif "توقف آپلود" in txt:
             st["auto_upload_enabled"] = False
             save_worker_state(st)
+            sync_state_to_github()
             listener_bot.send_message(
                 cid,
                 "⏸ <b>آپلود خودکار پیج متوقف شد.</b>\nتا زمانی که مجدداً آن را فعال نکنید، پستی در اینستاگرام آپلود نمی‌شود.",
@@ -899,13 +1001,15 @@ def process_single_telegram_update(u, published):
             st["auto_upload_enabled"] = True
             save_worker_state(st)
             clear_safety_cooldown()
+            sync_state_to_github()
             listener_bot.send_message(
                 cid,
-                f"▶️ <b>آپلود خودکار فعال شد</b> و طبق روال هر {to_persian_num(CYCLE_MINUTES)} دقیقه ادامه می‌یابد.",
+                f"▶️ <b>آپلود خودکار فعال شد</b> و طبق زمان‌بندی هر {to_persian_num(CYCLE_MINUTES)} دقیقه ادامه می‌یابد.",
                 parse_mode="HTML",
                 reply_markup=get_backup_kb(True)
             )
 
+        # فرمان ۸: کارنامه و آمار امروز
         elif "کارنامه" in txt or txt == "/stats":
             pending_tasks = get_current_pending_tasks(published)
             iran_now = datetime.utcnow() + timedelta(hours=3, minutes=30)
@@ -929,16 +1033,19 @@ def process_single_telegram_update(u, published):
             )
             listener_bot.send_message(cid, stat_msg, parse_mode="HTML", reply_markup=get_backup_kb(st.get("auto_upload_enabled", True)))
 
+        # فرمان ۹: تنظیم ساعات خاموشی
         elif "تنظیم ساعات خاموشی" in txt:
             listener_bot.send_message(
                 cid,
-                f"🕰 ساعت خاموشی فعلی: <b>{to_persian_num(st.get('sleep_start_hour', 0))} تا {to_persian_num(st.get('sleep_end_hour', 7))} صبح</b>\n\n"
-                "برای تغییر، عبارتی مانند نمونه زیر بفرستید:\n"
+                f"🕰 ساعت خاموشی فعلی انتشار اینستاگرام: <b>{to_persian_num(st.get('sleep_start_hour', 0))} تا {to_persian_num(st.get('sleep_end_hour', 7))} صبح</b>\n"
+                f"<i>(در ساعات خاموشی، ربات تلگرام همچنان ۱۰۰٪ بیدار و پاسخگو است)</i>\n\n"
+                "برای تغییر ساعت خاموشی، عبارتی مانند نمونه زیر بفرستید:\n"
                 "<code>تنظیم ساعت 0 تا 7</code>",
                 parse_mode="HTML",
                 reply_markup=get_backup_kb(st.get("auto_upload_enabled", True))
             )
 
+        # فرمان‌های ۱، ۳، ۴، ۵: دریافت همه، فقط ریلزها، فقط استوری‌ها، فقط پست‌ها
         elif "دریافت همه" in txt or "دریافت تمام" in txt or txt in ("/dump", "/all"):
             execute_manual_dump_action("dump_all", published)
         elif "فقط ریلز" in txt:
@@ -948,7 +1055,9 @@ def process_single_telegram_update(u, published):
         elif "فقط پست" in txt:
             execute_manual_dump_action("dump_posts", published)
 
+        # فرمان ۶: مشاهده و مدیریت ۵ مورد اول صف
         elif "مشاهده و مدیریت" in txt:
+            refresh_public_data()
             pending_tasks = get_current_pending_tasks(published)
             if not pending_tasks:
                 listener_bot.send_message(
@@ -963,18 +1072,25 @@ def process_single_telegram_update(u, published):
                 cap_short = (task.get("caption") or "بدون کپشن (استوری)").split("\n")[0][:45]
                 t_t = task.get("type", "")
                 item_txt = (
-                    f"🔢 <b>ردیف اولویت: #{to_persian_num(p_i)}</b>\n"
+                    f"🔢 <b>ردیف اولویت: #{to_persian_num(p_i)}</b> (ID: <code>{t_id}</code>)\n"
                     f"📂 نوع: <code>{t_t}</code>\n"
-                    f"📝 عنوان: {html.escape(cap_short)}..."
+                    f"📝 عنوان: {html.escape(cap_short)}...\n"
+                    f"<i>(برای تغییر کپشن، روی همین پیام ریپلای کنید)</i>"
                 )
                 ikb = InlineKeyboardMarkup(row_width=2)
+                ikb.add(
+                    InlineKeyboardButton("⚡️ اولویت اول", callback_data=f"q_top|{t_id}"),
+                    InlineKeyboardButton("📱 تبدیل به استوری", callback_data=f"q_tostory|{t_id}")
+                )
                 ikb.add(
                     InlineKeyboardButton("📥 دریافت فوری همین مورد", callback_data=f"q_vip|{t_id}"),
                     InlineKeyboardButton("🗑 حذف از صف", callback_data=f"q_del|{t_id}")
                 )
                 listener_bot.send_message(cid, item_txt, parse_mode="HTML", reply_markup=ikb)
 
+        # فرمان ۲: وضعیت صف اینستاگرام
         elif "وضعیت" in txt or txt == "/status":
+            refresh_public_data()
             pending_tasks = get_current_pending_tasks(published)
             r_cnt = sum(1 for _, t in pending_tasks if str(t.get("type", "")).lower() in ("reel", "video"))
             s_cnt = sum(1 for _, t in pending_tasks if "story" in str(t.get("type", "")).lower())
@@ -983,14 +1099,19 @@ def process_single_telegram_update(u, published):
             last_pub_ts = float(st.get("last_insta_publish_ts", 0))
             rem_wait = max(0, int(((CYCLE_MINUTES * 60) - (time.time() - last_pub_ts)) // 60))
             iran_now = datetime.utcnow() + timedelta(hours=3, minutes=30)
+            sleep_s = int(st.get("sleep_start_hour", 0))
+            sleep_e = int(st.get("sleep_end_hour", 7))
+
             if not st.get("auto_upload_enabled", True):
                 next_str = "⏸ متوقف شده توسط شما"
-            elif st.get("sleep_start_hour", 0) <= iran_now.hour < st.get("sleep_end_hour", 7):
-                next_str = f"💤 استراحت شبانه تا {to_persian_num(st.get('sleep_end_hour', 7))} صبح"
+            elif sleep_s <= iran_now.hour < sleep_e:
+                next_str = f"💤 استراحت شبانه اینستاگرام تا ساعت {to_persian_num(sleep_e)}:۰۰ صبح"
             elif rem_wait == 0:
-                next_str = "⚡️ در نوبت انتشار فوری"
+                next_str = "⚡️ در نوبت انتشار خودکار"
             else:
-                next_str = f"⏳ حدود {to_persian_num(rem_wait)} دقیقه دیگر"
+                next_dt = iran_now + timedelta(minutes=rem_wait)
+                next_clock = to_persian_num(next_dt.strftime("%H:%M"))
+                next_str = f"⏳ ساعت {next_clock} ({to_persian_num(rem_wait)} دقیقه دیگر)"
 
             has_sess = "✅ متصل و قفل‌شده" if (os.path.exists(SESSION_FILE) or st.get("active_sessionid")) else "⚠️ نیازمند ارسال سشن"
             listener_bot.send_message(
@@ -1006,6 +1127,7 @@ def process_single_telegram_update(u, published):
 
 
 def telegram_listener_thread_func(published):
+    global KEEP_RUNNING
     if not listener_bot:
         return
     try:
@@ -1013,7 +1135,8 @@ def telegram_listener_thread_func(published):
     except Exception:
         pass
 
-    print("Telegram Instant Listener Thread started for @newswriting1_bot!")
+    print("Telegram 24/7 Instant Listener Thread started for @newswriting1_bot!")
+    conflict_streak = 0
     while KEEP_RUNNING:
         try:
             st = load_worker_state()
@@ -1023,6 +1146,7 @@ def telegram_listener_thread_func(published):
                 timeout=3,
                 allowed_updates=["message", "callback_query"]
             )
+            conflict_streak = 0
             if updates:
                 for u in updates:
                     last_up_id = u.update_id
@@ -1034,13 +1158,22 @@ def telegram_listener_thread_func(published):
                     except Exception as e_inner:
                         print("Update process warning:", e_inner)
         except Exception as e:
-            print("Telegram polling warning:", e)
+            err_s = str(e)
+            # اگر نوبت جدیدتری در گیت‌هاب روشن شده باشد، این نوبت قدیمی به آرامی شیفت را تحویل می‌دهد
+            if "409" in err_s or "Conflict" in err_s:
+                conflict_streak += 1
+                if (time.time() - PROCESS_START_TS) > 90 and conflict_streak >= 2:
+                    print("Newer workflow instance took over @newswriting1_bot! Handing over cleanly...")
+                    KEEP_RUNNING = False
+                    break
+            else:
+                print("Telegram polling warning:", err_s)
             time.sleep(2)
         time.sleep(0.8)
 
 
 # ==========================================
-# ۶. ساخت پیام گزارش و چرخه آپلود اینستاگرام
+# ۶. ساخت پیام گزارش و چرخه زمان‌بندی انتشار اینستاگرام
 # ==========================================
 def extract_safe_label(task):
     cap = (task.get("caption") or "").strip()
@@ -1138,9 +1271,8 @@ def run_insta_publish_cycle(published):
     if not cl:
         return
 
-    if not IS_MANUAL_RUN:
-        jitter_sec = random.randint(10, 35)
-        time.sleep(jitter_sec)
+    jitter_sec = random.randint(10, 30)
+    time.sleep(jitter_sec)
 
     batch = pending_tasks[:MAX_ITEMS_PER_RUN]
     current_batch_ids = {tid for (tid, _) in batch}
@@ -1190,6 +1322,7 @@ def run_insta_publish_cycle(published):
                 d_st["posts"] = d_st.get("posts", 0) + 1
             st["daily_stats"] = d_st
             save_worker_state(st)
+            sync_state_to_github()
 
             full_msg = build_two_part_message(t_type, pending_tasks, published, current_batch_ids)
             notify_admin(full_msg)
@@ -1226,6 +1359,7 @@ def main():
     refresh_public_data()
     published = load_published_list()
 
+    # راه‌اندازی نخ ۲۴ ساعته ربات تلگرام @newswriting1_bot
     tg_thread = threading.Thread(target=telegram_listener_thread_func, args=(published,), daemon=True)
     tg_thread.start()
 
@@ -1236,6 +1370,7 @@ def main():
                 published.append(tid)
         save_published_list(published)
         clear_safety_cooldown()
+        sync_state_to_github()
         notify_backup_bot("🧹 <b>پاکسازی کامل صف با موفقیت انجام شد!</b>")
 
     if DUMP_NOW_INPUT in ("yes", "true", "1", "بله"):
@@ -1244,16 +1379,16 @@ def main():
     if IS_MANUAL_RUN and backup_bot:
         pending_now = get_current_pending_tasks(published)
         notify_backup_bot(
-            f"✅ <b>ربات @newswriting1_bot متصل شد و با پچ ضد 404 آماده آپلود است!</b>\n"
-            f"📦 تعداد فایل‌های فعلی در صف: <b>{to_persian_num(len(pending_now))} مورد</b>"
+            f"✅ <b>ربات @newswriting1_bot به صورت ۲۴ ساعته آنلاین شد!</b>\n"
+            f"📦 تعداد فایل‌های فعلی در صف: <b>{to_persian_num(len(pending_now))} مورد</b>\n"
+            f"🕒 انتشار خودکار اینستاگرام دقیقاً طبق زمان‌بندی {to_persian_num(CYCLE_MINUTES)} دقیقه‌ای انجام می‌شود."
         )
 
-    print("Starting 24-Minute Active Loop...")
+    print("Starting 55-Minute Continuous 24/7 Loop...")
     start_loop_ts = time.time()
     last_git_sync_ts = time.time()
-    force_first_manual = IS_MANUAL_RUN
 
-    while (time.time() - start_loop_ts) < LOOP_DURATION_SECONDS:
+    while KEEP_RUNNING and (time.time() - start_loop_ts) < LOOP_DURATION_SECONDS:
         if (time.time() - last_git_sync_ts) >= 180:
             refresh_public_data()
             last_git_sync_ts = time.time()
@@ -1266,32 +1401,34 @@ def main():
         sleep_h_end = int(st.get("sleep_end_hour", 7))
         is_sleep_hours = (sleep_h_start <= iran_now.hour < sleep_h_end)
 
+        # ۱. در ساعت خاموشی شبانه (۰۰:۰۰ تا ۰۷:۰۰ صبح): تخلیه خودکار صف به تلگرام و توقف آپلود اینستاگرام
         if is_sleep_hours:
             if st.get("last_midnight_dump_date") != today_date_key:
                 refresh_public_data()
                 pending_tasks = get_current_pending_tasks(published)
-                deliver_tasks_to_telegram(
-                    pending_tasks, published, title_header="تخلیه خودکار شبانه (ساعت خاموشی)"
-                )
+                if pending_tasks:
+                    deliver_tasks_to_telegram(
+                        pending_tasks, published, title_header="تخلیه خودکار شبانه (شروع ساعت خاموشی)"
+                    )
                 st = load_worker_state()
                 st["last_midnight_dump_date"] = today_date_key
                 save_worker_state(st)
+                sync_state_to_github()
         else:
-            if st.get("auto_upload_enabled", True):
+            # ۲. در ساعات بیداری (۰۷:۰۰ صبح تا ۲۴:۰۰ شب): انتشار دقیق هر ۶۰ دقیقه
+            if st.get("auto_upload_enabled", True) and not is_in_safety_cooldown():
                 last_pub_ts = float(st.get("last_insta_publish_ts", 0))
                 elapsed = time.time() - last_pub_ts
-                if force_first_manual or (elapsed >= (CYCLE_MINUTES * 60)):
-                    force_first_manual = False
-                    if not is_in_safety_cooldown() or IS_MANUAL_RUN:
-                        st["last_insta_publish_ts"] = time.time() - ((CYCLE_MINUTES - 5) * 60)
-                        save_worker_state(st)
-                        run_insta_publish_cycle(published)
+                if elapsed >= (CYCLE_MINUTES * 60):
+                    st["last_insta_publish_ts"] = time.time() - ((CYCLE_MINUTES - 5) * 60)
+                    save_worker_state(st)
+                    run_insta_publish_cycle(published)
 
         time.sleep(4)
 
     KEEP_RUNNING = False
     time.sleep(2)
-    print("24-minute cycle finished cleanly.")
+    print("Cycle finished cleanly.")
 
 
 if __name__ == "__main__":
