@@ -23,7 +23,7 @@ from telebot.types import (
 )
 from instagrapi import Client
 
-# جلوگیری قطعی از قفل شدن سوکت تلگرام
+# جلوگیری قطعی از فریز شدن سوکت تلگرام
 apihelper.CONNECT_TIMEOUT = 10
 apihelper.READ_TIMEOUT = 12
 
@@ -34,16 +34,15 @@ except Exception:
     HAS_STORY_POLL = False
 
 # ==========================================
-# ۱. تنظیمات پایه و مشخصات شبیه‌ساز گوشی اندروید
+# ۱. تنظیمات پایه و توکن‌ها (نسخه نهایی پایدار بدون لاگین مجدد)
 # ==========================================
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 BACKUP_BOT_TOKEN = os.environ.get("BACKUP_BOT_TOKEN", "").strip()
 
 ADMIN_ID = os.environ.get("ADMIN_ID", "30956754").strip()
 INSTA_USER = os.environ.get("INSTA_USER", "shirazlastnews").strip() or "shirazlastnews"
-INSTA_PASS = os.environ.get("INSTA_PASS", "").strip()
-CHALLENGE_CODE_ENV = os.environ.get("CHALLENGE_CODE", "").strip()
 
+RAW_SID = os.environ.get("IG_SESSIONID", "").strip()
 IS_MANUAL_RUN = os.environ.get("GITHUB_EVENT_NAME", "") == "workflow_dispatch"
 DUMP_NOW_INPUT = os.environ.get("DUMP_QUEUE_NOW", "no").strip().lower()
 CLEAR_CMD_INPUT = os.environ.get("CLEAR_QUEUE", "no").strip().lower()
@@ -56,7 +55,7 @@ QUEUE_FILE = "public_data/drafts/insta_queue.json"
 PUBLIC_REPO_URL = "https://github.com/arpparnian-arch/shirazlastnewsbot.git"
 
 MAX_ITEMS_PER_RUN = 2
-# چرخه ۶۱ دقیقه‌ای برای جلوگیری کامل از حساسیت اینستاگرام
+# چرخه ۶۱ دقیقه‌ای انتشار در اینستاگرام
 CYCLE_MINUTES = 61
 # اجرای پیوسته ۲۴ دقیقه‌ای هماهنگ با کرون ۲۵ دقیقه‌ای گیت‌هاب
 LOOP_DURATION_SECONDS = 24 * 60
@@ -64,12 +63,10 @@ LOOP_DURATION_SECONDS = 24 * 60
 STATE_LOCK = threading.Lock()
 GIT_LOCK = threading.Lock()
 KEEP_RUNNING = True
-TELEGRAM_CHALLENGE_CODE = None
-FORCE_RELOGIN_REQUESTED = False
 
 # ربات اول (@shirazlastnews_bot): فقط برای گزارش‌های انتشار اینستاگرام
 bot = telebot.TeleBot(TOKEN, threaded=False) if TOKEN else None
-# دو کلاینت مجزا برای ربات دوم (@newswriting1_bot) جهت پاسخگویی آنی
+# دو کلاینت مجزا برای ربات دوم (@newswriting1_bot) جهت پاسخگویی آنی ۲۴ ساعته
 backup_bot = telebot.TeleBot(BACKUP_BOT_TOKEN, threaded=False) if BACKUP_BOT_TOKEN else bot
 listener_bot = telebot.TeleBot(BACKUP_BOT_TOKEN, threaded=False) if BACKUP_BOT_TOKEN else None
 
@@ -93,6 +90,8 @@ def load_worker_state():
         "backup_chat_id": ADMIN_ID,
         "backup_last_update_id": 0,
         "last_insta_publish_ts": 0,
+        "last_env_sid_hash": "",
+        "active_sessionid": "",
         "daily_stats": {"date": "", "reels": 0, "stories": 0, "posts": 0}
     }
     with STATE_LOCK:
@@ -179,10 +178,7 @@ def get_backup_kb(auto_enabled=True):
         KeyboardButton(toggle_txt),
         KeyboardButton("📈 کارنامه و آمار امروز")
     )
-    mk.add(
-        KeyboardButton("⚙️ تنظیم ساعات خاموشی"),
-        KeyboardButton("🔐 ورود مجدد گوشی اندروید")
-    )
+    mk.add(KeyboardButton("⚙️ تنظیم ساعات خاموشی"))
     return mk
 
 
@@ -222,7 +218,7 @@ def notify_backup_bot(msg, with_kb=True):
 
 
 # ==========================================
-# ۲. شبیه‌ساز واقعی گوشی اندروید (رفع کامل خطای Out of Date)
+# ۲. مدیریت پایدار سشن بدون ارسال درخواست لاگین (صفر درصد حساسیت)
 # ==========================================
 def is_in_safety_cooldown():
     st = load_worker_state()
@@ -249,102 +245,7 @@ def clear_safety_cooldown():
         save_worker_state(st)
 
 
-# دریافت کلید رمزنگاری نسخه ۴ (#PWD_INSTAGRAM:4) با هدرهای رسمی اندروید
-_orig_password_encrypt = getattr(Client, "password_encrypt", None)
-
-
-def _safe_password_encrypt(self, password):
-    try:
-        hdrs = getattr(self, "base_headers", None) or {
-            "User-Agent": getattr(
-                self,
-                "user_agent",
-                "Instagram 317.0.0.34.109 Android (34/14; 480dpi; 1080x2400; Samsung; SM-S918B; dm3q; qcom; en_US; 562021275)"
-            ),
-            "X-IG-App-ID": "567067343352427",
-            "X-IG-Capabilities": "3brTv10=",
-            "Accept-Language": "en-US",
-        }
-        # ۱. بررسی هدرهای آخرین پاسخ دریافتی از سرور موبایل
-        last_resp = getattr(self, "last_response", None)
-        if last_resp is not None and hasattr(last_resp, "headers"):
-            kid = last_resp.headers.get("ig-set-password-encryption-key-id")
-            pub = last_resp.headers.get("ig-set-password-encryption-pub-key")
-            if kid and pub and str(kid).strip().isdigit():
-                self.password_publickeys = lambda k=int(str(kid).strip()), p=pub.strip(): (k, p)
-                if _orig_password_encrypt:
-                    return _orig_password_encrypt(self, password)
-
-        # ۲. دریافت کلید رمزنگاری RSA با ارسال هدرهای واقعی اپلیکیشن اندروید
-        uid_val = getattr(self, "uuid", None) or getattr(self, "phone_id", None) or ""
-        for method, ep, payload in [
-            ("POST", "https://i.instagram.com/api/v1/qe/sync/", {"id": uid_val, "experiments": ""}),
-            ("POST", "https://i.instagram.com/api/v1/launcher/sync/", {"id": uid_val}),
-            ("GET", "https://i.instagram.com/api/v1/zr/token/result/", None),
-            ("GET", "https://i.instagram.com/api/v1/si/fetch_headers/?challenge_type=signup", None),
-        ]:
-            try:
-                if method == "POST":
-                    r = self.private.post(ep, data=payload, headers=hdrs, timeout=10)
-                else:
-                    r = self.private.get(ep, headers=hdrs, timeout=10)
-                kid = r.headers.get("ig-set-password-encryption-key-id")
-                pub = r.headers.get("ig-set-password-encryption-pub-key")
-                if kid is not None and pub is not None and str(kid).strip().isdigit():
-                    self.password_publickeys = lambda k=int(str(kid).strip()), p=pub.strip(): (k, p)
-                    if _orig_password_encrypt:
-                        return _orig_password_encrypt(self, password)
-            except Exception:
-                pass
-
-        if _orig_password_encrypt:
-            return _orig_password_encrypt(self, password)
-    except Exception as e:
-        print("Password encrypt notice:", e)
-    return f"#PWD_INSTAGRAM:0:{int(time.time())}:{password}"
-
-
-Client.password_encrypt = _safe_password_encrypt
-
-# محافظت از توکن موبایلی اندروید در برابر پاک شدن در حین آپلود اسلایدهای آلبوم
-_orig_send_private_request = getattr(Client, "_send_private_request", None)
-
-
-def _locked_send_private_request(self, endpoint, *args, **kwargs):
-    saved_auth = getattr(self, "_native_android_auth", None)
-    saved_bearer = getattr(self, "_native_android_bearer", None)
-
-    if saved_auth and saved_bearer:
-        if not getattr(self, "authorization_data", None):
-            self.authorization_data = dict(saved_auth)
-        if not self.private.headers.get("Authorization"):
-            self.private.headers["Authorization"] = saved_bearer
-
-    try:
-        return _orig_send_private_request(self, endpoint, *args, **kwargs)
-    finally:
-        cur_auth = getattr(self, "authorization_data", None) or {}
-        if cur_auth.get("ds_user_id") and cur_auth.get("sessionid"):
-            self._native_android_auth = dict(cur_auth)
-            if self.private.headers.get("Authorization"):
-                self._native_android_bearer = self.private.headers["Authorization"]
-        elif saved_auth and saved_bearer:
-            self.authorization_data = dict(saved_auth)
-            self.private.headers["Authorization"] = saved_bearer
-
-
-if _orig_send_private_request:
-    Client._send_private_request = _locked_send_private_request
-
-
-def configure_android_phone_identity(cl):
-    """تثبیت هویت سخت‌افزاری گوشی اندروید با حفظ کامل نسخه جدید اپلیکیشن"""
-    cl.delay_range = [3, 7]
-    cl.country = "IR"
-    cl.country_code = 98
-    cl.locale = "en_US"
-    cl.timezone_offset = 12600  # +03:30 Tehran
-
+def attach_persistent_uuids(cl):
     if os.path.exists(UUIDS_FILE):
         try:
             uuids = json.load(open(UUIDS_FILE, "r", encoding="utf-8"))
@@ -360,181 +261,164 @@ def configure_android_phone_identity(cl):
         pass
 
 
-def has_active_mobile_auth(cl):
-    """تشخیص فوری دریافت شدن توکن سشن بلافاصله پس از تایید کد ۶ رقمی"""
-    auth = getattr(cl, "authorization_data", None) or {}
-    if auth.get("ds_user_id") and auth.get("sessionid"):
-        return True
-    try:
-        sid_cookie = cl.private.cookies.get("sessionid")
-        uid_cookie = cl.private.cookies.get("ds_user_id")
-        if sid_cookie and ":" in str(sid_cookie):
-            clean_sid = urllib.parse.unquote(str(sid_cookie).strip())
-            uid_str = str(uid_cookie or clean_sid.split(":")[0]).strip()
-            cl.authorization_data = {
-                "ds_user_id": uid_str,
-                "sessionid": clean_sid,
-                "should_use_header_over_cookies": True,
-            }
-            return True
-    except Exception:
-        pass
-    last_resp = getattr(cl, "last_response", None)
-    if last_resp is not None and hasattr(last_resp, "headers"):
-        ig_auth = last_resp.headers.get("ig-set-authorization", "")
-        if ig_auth.startswith("Bearer IGT:2:"):
-            b64_part = ig_auth.split("Bearer IGT:2:", 1)[1].strip()
-            try:
-                decoded = json.loads(base64.b64decode(b64_part).decode("utf-8"))
-                if decoded.get("sessionid"):
-                    cl.authorization_data = decoded
-                    return True
-            except Exception:
-                pass
-    return False
+def build_igt_bearer_header(uid_str, raw_colon_sid):
+    auth_dict = {
+        "ds_user_id": str(uid_str),
+        "sessionid": raw_colon_sid,
+        "should_use_header_over_cookies": True,
+    }
+    b64_payload = base64.b64encode(
+        json.dumps(auth_dict, separators=(",", ":")).encode("utf-8")
+    ).decode("utf-8")
+    return auth_dict, f"Bearer IGT:2:{b64_payload}"
 
 
-def lock_native_session_in_memory(cl):
-    """قفل کردن توکن واقعی اندروید در حافظه و ذخیره تضمینی در insta_session.json"""
-    try:
-        has_active_mobile_auth(cl)
-        settings = cl.get_settings()
-        auth = cl.authorization_data or settings.get("authorization_data", {}) or {}
-        if auth.get("ds_user_id") and auth.get("sessionid"):
-            cl._native_android_auth = dict(auth)
-            b64_payload = base64.b64encode(
-                json.dumps(auth, separators=(",", ":")).encode("utf-8")
-            ).decode("utf-8")
-            bearer_str = cl.private.headers.get("Authorization") if hasattr(cl, "private") else None
-            if not bearer_str or not str(bearer_str).startswith("Bearer IGT:2:"):
-                bearer_str = f"Bearer IGT:2:{b64_payload}"
-            cl._native_android_bearer = bearer_str
-            cl.private.headers["Authorization"] = bearer_str
+def inject_mobile_sessionid(cl, sid_input):
+    raw_colon_sid = urllib.parse.unquote(str(sid_input).strip()).strip('"').strip("'").strip()
+    if not raw_colon_sid or ":" not in raw_colon_sid:
+        return False
+    uid_str = raw_colon_sid.split(":")[0].strip()
+    if not uid_str.isdigit():
+        return False
 
-            settings["authorization_data"] = dict(auth)
-            settings["uuids"] = cl.uuids
-            with open(SESSION_FILE, "w", encoding="utf-8") as f:
-                json.dump(settings, f, indent=2)
-            with open(UUIDS_FILE, "w", encoding="utf-8") as f:
-                json.dump(cl.uuids, f, indent=2)
-            print(f"Native Android session saved for user_id={auth.get('ds_user_id')}")
-            return True
-    except Exception as e:
-        print("Save native session warning:", e)
-    return False
+    attach_persistent_uuids(cl)
+    auth_dict, bearer_str = build_igt_bearer_header(uid_str, raw_colon_sid)
 
-
-def force_android_phone_login():
-    """
-    ورود مستقیم شبیه‌ساز گوشی اندروید با نسخه جدید (بدون فراخوانی درگاه قدیمی login_legacy)
-    """
-    global TELEGRAM_CHALLENGE_CODE
-    if not INSTA_PASS:
-        notify_backup_bot(
-            "⚠️ <b>رمز عبور اینستاگرام (INSTA_PASS) در بخش Secrets گیت‌هاب تنظیم نشده است!</b>"
-        )
-        return None
-
-    cl = Client()
-    configure_android_phone_identity(cl)
+    settings = cl.get_settings()
+    settings["authorization_data"] = dict(auth_dict)
+    settings["cookies"] = {
+        "sessionid": raw_colon_sid,
+        "ds_user_id": uid_str,
+    }
+    cl.set_settings(settings)
     cl.init()
 
-    def interactive_telegram_code_handler(username, choice=None):
-        global TELEGRAM_CHALLENGE_CODE
-        TELEGRAM_CHALLENGE_CODE = None
-        notify_backup_bot(
-            f"📲 <b>شبیه‌ساز گوشی اندروید در حال ورود به پیج <code>@{INSTA_USER}</code> است!</b>\n\n"
-            f"🔐 اینستاگرام یک <b>کد تایید ۶ رقمی ({choice})</b> به ایمیل یا پیامک شما ارسال کرده است.\n"
-            f"👈 <b>لطفاً همین الان (ظرف ۳ دقیقه) آن کد ۶ رقمی را در همین چت (@newswriting1_bot) بفرستید</b> تا ورود تکمیل شود:"
-        )
-        wait_start = time.time()
-        while (time.time() - wait_start) < 180:
-            if TELEGRAM_CHALLENGE_CODE:
-                code_str = str(TELEGRAM_CHALLENGE_CODE).strip()
-                TELEGRAM_CHALLENGE_CODE = None
-                notify_backup_bot(f"✅ کد <code>{code_str}</code> دریافت شد! در حال ثبت و قفل کردن نشست اندروید...")
-                return code_str
-            time.sleep(1.2)
+    cl.authorization_data = dict(auth_dict)
+    cl.private.headers.update({"Authorization": bearer_str})
+    cl.private.cookies.set("sessionid", raw_colon_sid, domain=".instagram.com")
+    cl.private.cookies.set("ds_user_id", uid_str, domain=".instagram.com")
+    return True
 
-        return CHALLENGE_CODE_ENV or "807231"
 
-    cl.challenge_code_handler = interactive_telegram_code_handler
-
+def save_valid_session(cl, fallback_sid=""):
     try:
-        print(f"Simulating modern Android login for @{INSTA_USER}...")
-        cl.login(INSTA_USER, INSTA_PASS)
-        if lock_native_session_in_memory(cl):
-            notify_backup_bot(
-                "✅ <b>شبیه‌ساز گوشی اندروید با موفقیت وارد اینستاگرام شد!</b>\n"
-                "🔒 نشست واقعی موبایل در <code>insta_session.json</code> قفل و ذخیره گردید و دیگر نیازی به لاگین مجدد نیست."
-            )
-            return cl
-    except Exception as e1:
-        # اگر کد ۶ رقمی تایید شده و توکن سشن دریافت شده باشد، بلافاصله آن را ذخیره کن
-        if has_active_mobile_auth(cl) and lock_native_session_in_memory(cl):
-            notify_backup_bot(
-                "✅ <b>کد ۶ رقمی تایید شد و نشست شبیه‌ساز گوشی اندروید با موفقیت قفل و ذخیره گردید!</b>"
-            )
-            return cl
+        settings = cl.get_settings()
+        auth = cl.authorization_data or settings.get("authorization_data", {}) or {}
+        st = load_worker_state()
 
-        err1 = str(e1)
-        print("First Android login attempt notice:", err1)
-        notify_backup_bot(
-            f"📲 <b>درخواست ورود گوشی اندروید ارسال شد!</b>\n"
-            f"پیام سرور: <code>{html.escape(err1[:220])}</code>\n\n"
-            f"👈 <b>اگر در اپلیکیشن اینستاگرام روی گوشی اعلان «It's me / این من بودم» آمده، همین الان روی آن بزنید.</b>\n"
-            f"⏳ ربات ۶۰ ثانیه منتظر تایید شما می‌ماند و سپس با همان شناسه گوشی وارد می‌شود..."
+        raw_sid = (
+            fallback_sid
+            or auth.get("sessionid", "")
+            or st.get("active_sessionid", "")
+            or RAW_SID
         )
-        time.sleep(60)
+        clean_sid = urllib.parse.unquote(str(raw_sid).strip()).strip('"').strip("'").strip()
+        if not clean_sid or ":" not in clean_sid:
+            return False
 
-        try:
-            cl.login(INSTA_USER, INSTA_PASS)
-            if lock_native_session_in_memory(cl):
-                notify_backup_bot(
-                    "✅ <b>ورود شبیه‌ساز گوشی اندروید پس از تایید شما با موفقیت قفل و ذخیره شد!</b>"
-                )
-                return cl
-        except Exception as e2:
-            if has_active_mobile_auth(cl) and lock_native_session_in_memory(cl):
-                notify_backup_bot(
-                    "✅ <b>نشست شبیه‌ساز گوشی اندروید با موفقیت دریافت و ذخیره شد!</b>"
-                )
-                return cl
-            notify_backup_bot(
-                f"⚠️ <b>ورود گوشی اندروید کامل نشد:</b>\n<code>{html.escape(str(e2)[:300])}</code>\n\n"
-                f"💡 <i>هر زمان آماده بودید، دکمه «🔐 ورود مجدد گوشی اندروید» را در کیبورد پایین بزنید.</i>"
-            )
-            return None
+        ds_uid = clean_sid.split(":")[0].strip() or "56014548029"
+        auth["ds_user_id"] = str(ds_uid)
+        auth["sessionid"] = clean_sid
+        auth["should_use_header_over_cookies"] = True
+        settings["authorization_data"] = auth
 
-    return cl if has_active_mobile_auth(cl) else None
+        cookies = settings.get("cookies", {}) or {}
+        cookies["sessionid"] = clean_sid
+        cookies["ds_user_id"] = str(ds_uid)
+        settings["cookies"] = cookies
+
+        with open(SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+
+        st["active_sessionid"] = clean_sid
+        save_worker_state(st)
+        print(f"Session saved cleanly (user_id={ds_uid}).")
+        return True
+    except Exception as e:
+        print("Save session warning:", e)
+    return False
 
 
-def get_insta_client(force_relogin=False):
-    """بارگذاری سشن واقعی اندروید و ورود خودکار با شبیه‌ساز گوشی در صورت نیاز"""
-    if not force_relogin and os.path.exists(SESSION_FILE):
+def get_insta_client():
+    """
+    بارگذاری بی‌صدا و ایمن سشن (بدون فراخوانی cl.login و بدون ایجاد اعلان It's me)
+    """
+    st = load_worker_state()
+    clean_env_sid = urllib.parse.unquote(RAW_SID.strip()).strip('"').strip("'").strip() if RAW_SID else ""
+    env_hash = hashlib.md5(clean_env_sid.encode("utf-8")).hexdigest() if clean_env_sid else ""
+
+    # اگر کاربر سشن جدیدی در IG_SESSIONID گیت‌هاب گذاشته، خودکار جایگزین سشن قبلی کن
+    if clean_env_sid and ":" in clean_env_sid and env_hash != st.get("last_env_sid_hash"):
+        print("New IG_SESSIONID detected in Secrets! Updating session automatically...")
+        cl = Client()
+        cl.delay_range = [4, 9]
+        if inject_mobile_sessionid(cl, clean_env_sid):
+            st["last_env_sid_hash"] = env_hash
+            st["active_sessionid"] = clean_env_sid
+            save_worker_state(st)
+            save_valid_session(cl, fallback_sid=clean_env_sid)
+            clear_safety_cooldown()
+            return cl
+
+    # ۱. استفاده از سشن ذخیره‌شده فعلی
+    if os.path.exists(SESSION_FILE):
         try:
             saved_data = json.load(open(SESSION_FILE, "r", encoding="utf-8"))
             saved_auth = saved_data.get("authorization_data", {}) or {}
-            if saved_auth.get("ds_user_id") and saved_auth.get("sessionid"):
+            saved_cookies = saved_data.get("cookies", {}) or {}
+            saved_sid = (
+                saved_auth.get("sessionid")
+                or saved_cookies.get("sessionid")
+                or st.get("active_sessionid")
+                or clean_env_sid
+            )
+            saved_sid = urllib.parse.unquote(str(saved_sid).strip()).strip('"').strip("'").strip()
+
+            if saved_sid and ":" in saved_sid:
                 cl = Client()
-                configure_android_phone_identity(cl)
+                cl.delay_range = [4, 9]
+                attach_persistent_uuids(cl)
                 try:
                     cl.load_settings(SESSION_FILE, override_app_version=True)
                 except TypeError:
                     cl.load_settings(SESSION_FILE)
-                configure_android_phone_identity(cl)
                 cl.init()
-                lock_native_session_in_memory(cl)
-                print(f"Loaded existing Native Android session for user {saved_auth.get('ds_user_id')}!")
+
+                uid_str = saved_sid.split(":")[0].strip()
+                auth_dict, bearer_str = build_igt_bearer_header(uid_str, saved_sid)
+                cl.authorization_data = auth_dict
+                cl.private.headers.update({"Authorization": bearer_str})
+                cl.private.cookies.set("sessionid", saved_sid, domain=".instagram.com")
+                cl.private.cookies.set("ds_user_id", uid_str, domain=".instagram.com")
+                print(f"Loaded existing session silently (user_id={uid_str})!")
                 return cl
         except Exception as e:
-            print("Saved session load notice:", e)
+            print("Warning loading saved session:", e)
 
-    return force_android_phone_login()
+    # ۲. استفاده از سشن ثبت‌شده در تلگرام یا IG_SESSIONID
+    fallback_sid = st.get("active_sessionid") or clean_env_sid
+    if fallback_sid and ":" in fallback_sid:
+        try:
+            cl = Client()
+            cl.delay_range = [4, 9]
+            if inject_mobile_sessionid(cl, fallback_sid):
+                save_valid_session(cl, fallback_sid=fallback_sid)
+                print("Prepared mobile session via SessionID!")
+                return cl
+        except Exception as e:
+            print("SessionID setup error:", e)
+
+    notify_backup_bot(
+        "⚠️ <b>سشن فعال اینستاگرام یافت نشد.</b>\n"
+        "برای جلوگیری از حساسیت پیج، لاگین با رمز عبور خاموش است.\n"
+        "لطفاً در پنجره Incognito مرورگر (با Passkey یا واتس‌اپ) وارد شوید و کد <code>sessionid</code> را با دستور زیر در همین چت بفرستید:\n"
+        "<code>سشن: کد_سشن_شما</code>"
+    )
+    return None
 
 
 # ==========================================
-# ۳. توابع آپلود مدیا و خواندن صف
+# ۳. توابع آپلود مدیا (حذف تله configure_to_sidecar برای جلوگیری از پریدن سشن)
 # ==========================================
 def get_task_priority(task_type):
     t = str(task_type).lower().strip()
@@ -562,13 +446,9 @@ def make_clean_cover_thumb(video_path):
 
 
 def execute_upload_task(cl, t_type, real_files, caption):
-    if t_type == "photo":
+    # نکته کلیدی: ارسال پست‌ها و آلبوم‌ها از درگاه امن photo_upload تا اینستاگرام هرگز سشن را باطل نکند
+    if t_type in ("photo", "album"):
         cl.photo_upload(real_files[0], caption=caption)
-    elif t_type == "album":
-        if len(real_files) >= 2:
-            cl.album_upload(real_files, caption=caption)
-        else:
-            cl.photo_upload(real_files[0], caption=caption)
     elif t_type == "story_photo":
         if HAS_STORY_POLL:
             try:
@@ -819,7 +699,6 @@ def execute_manual_dump_action(user_action, published):
 # ۵. نخ اختصاصی ربات دوم تلگرام (@newswriting1_bot)
 # ==========================================
 def process_single_telegram_update(u, published):
-    global TELEGRAM_CHALLENGE_CODE, FORCE_RELOGIN_REQUESTED
     if not listener_bot:
         return
     st = load_worker_state()
@@ -884,21 +763,25 @@ def process_single_telegram_update(u, published):
             st["backup_chat_id"] = cid
             save_worker_state(st)
 
-        # تشخیص فوری کد ۶ رقمی ایمیل/پیامک اینستاگرام
-        digits_only = raw_txt.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")).strip()
-        if re.fullmatch(r"\d{6}", digits_only):
-            TELEGRAM_CHALLENGE_CODE = digits_only
-            listener_bot.send_message(cid, f"🔐 کد ۶ رقمی <code>{digits_only}</code> دریافت و به شبیه‌ساز اندروید تحویل داده شد!", parse_mode="HTML")
-            return
-
-        if "ورود مجدد" in txt or txt in ("/login", "لاگین"):
-            FORCE_RELOGIN_REQUESTED = True
-            listener_bot.send_message(
-                cid,
-                "📱 <b>فرمان ورود با شبیه‌ساز گوشی اندروید صادر شد!</b>\n"
-                "تا چند ثانیه دیگر فرآیند ورود آغاز می‌شود؛ اگر کد ۶ رقمی به ایمیلتان آمد، همان عدد را در همین چت بفرستید.",
-                parse_mode="HTML"
-            )
+        # امکان ثبت مستقیم سشن جدید از داخل چت تلگرام (حتی اگر بدون پیشوند «سشن:» فرستاده شود)
+        if raw_txt.startswith("سشن:") or raw_txt.startswith("/session") or ("56014548029" in raw_txt and (":" in raw_txt or "%3A" in raw_txt)):
+            raw_sid = raw_txt.replace("سشن:", "").replace("/session", "").strip()
+            cl_test = Client()
+            if inject_mobile_sessionid(cl_test, raw_sid):
+                clean_s = urllib.parse.unquote(raw_sid).strip('"').strip("'").strip()
+                st["active_sessionid"] = clean_s
+                save_worker_state(st)
+                save_valid_session(cl_test, fallback_sid=clean_s)
+                clear_safety_cooldown()
+                listener_bot.send_message(
+                    cid,
+                    "✅ <b>سشن جدید اینستاگرام با موفقیت ثبت و قفل شد!</b>\n"
+                    "از این لحظه آپلود استوری، ریلز و پست‌ها بدون هیچ قطعی ادامه می‌یابد.",
+                    parse_mode="HTML",
+                    reply_markup=get_backup_kb(st.get("auto_upload_enabled", True))
+                )
+            else:
+                listener_bot.send_message(cid, "⚠️ فرمت کد سشن معتبر نیست.")
             return
 
         if txt.startswith("تنظیم ساعت"):
@@ -919,8 +802,8 @@ def process_single_telegram_update(u, published):
         if txt in ("/start", "/menu", "منو", "شروع"):
             listener_bot.send_message(
                 cid,
-                "👋 <b>ربات مدیریت و شبیه‌ساز اندروید اینستاگرام فعال است! (پاسخگویی آنی ۲۴ ساعته ⚡️)</b>\n\n"
-                "از دکمه‌های زیر می‌توانید در هر لحظه برای مدیریت صف، ورود اندروید و تحویل فایل‌ها استفاده کنید:",
+                "👋 <b>ربات مدیریت و تحویل فایل‌های اینستاگرام فعال است! (پاسخگویی آنی ۲۴ ساعته ⚡️)</b>\n\n"
+                "از دکمه‌های زیر می‌توانید در هر لحظه برای مدیریت صف و تحویل فایل‌ها استفاده کنید:",
                 parse_mode="HTML",
                 reply_markup=get_backup_kb(st.get("auto_upload_enabled", True))
             )
@@ -938,6 +821,7 @@ def process_single_telegram_update(u, published):
         elif "فعال سازی آپلود" in txt:
             st["auto_upload_enabled"] = True
             save_worker_state(st)
+            clear_safety_cooldown()
             listener_bot.send_message(
                 cid,
                 f"▶️ <b>آپلود خودکار فعال شد</b> و طبق روال هر {to_persian_num(CYCLE_MINUTES)} دقیقه ادامه می‌یابد.",
@@ -1031,11 +915,11 @@ def process_single_telegram_update(u, published):
             else:
                 next_str = f"⏳ حدود {to_persian_num(rem_wait)} دقیقه دیگر"
 
-            has_sess = "✅ متصل (گوشی اندروید)" if os.path.exists(SESSION_FILE) else "⚠️ نیازمند ورود"
+            has_sess = "✅ متصل و قفل‌شده" if (os.path.exists(SESSION_FILE) or st.get("active_sessionid")) else "⚠️ نیازمند ارسال سشن"
             listener_bot.send_message(
                 cid,
                 f"📊 <b>وضعیت لحظه‌ای صف اینستاگرام:</b>\n\n"
-                f"📱 وضعیت سشن: <b>{has_sess}</b>\n"
+                f"🔐 وضعیت سشن: <b>{has_sess}</b>\n"
                 f"🎬 ریلز: <b>{to_persian_num(r_cnt)}</b> | 📱 استوری: <b>{to_persian_num(s_cnt)}</b> | 🖼 پست: <b>{to_persian_num(p_cnt)}</b>\n"
                 f"📦 مجموع کل در صف: <b>{to_persian_num(len(pending_tasks))} مورد</b>\n"
                 f"🕒 نوبت بعدی آپلود خودکار: <b>{next_str}</b>",
@@ -1169,18 +1053,13 @@ def build_two_part_message(published_type, all_sorted_pending, published_list, c
 def run_insta_publish_cycle(published):
     refresh_public_data()
     pending_tasks = get_current_pending_tasks(published)
+    if not pending_tasks:
+        print("Queue is empty. Skipping Instagram connection.")
+        return
 
-    if not os.path.exists(SESSION_FILE):
-        cl = get_insta_client(force_relogin=True)
-        if not cl or not pending_tasks:
-            return
-    else:
-        if not pending_tasks:
-            print("Queue is empty. Skipping Instagram connection.")
-            return
-        cl = get_insta_client(force_relogin=False)
-        if not cl:
-            return
+    cl = get_insta_client()
+    if not cl:
+        return
 
     if not IS_MANUAL_RUN:
         jitter_sec = random.randint(10, 35)
@@ -1213,26 +1092,10 @@ def run_insta_publish_cycle(published):
 
         try:
             print(f"Publishing {t_type} -> {real_files[0]} ...")
-            try:
-                execute_upload_task(cl, t_type, real_files, caption)
-            except Exception as first_err:
-                if "login_required" in str(first_err).lower():
-                    print("Session expired on server! Triggering fresh Native Android login...")
-                    if os.path.exists(SESSION_FILE):
-                        try:
-                            os.remove(SESSION_FILE)
-                        except Exception:
-                            pass
-                    cl = get_insta_client(force_relogin=True)
-                    if not cl:
-                        raise first_err
-                    execute_upload_task(cl, t_type, real_files, caption)
-                else:
-                    raise first_err
-
+            execute_upload_task(cl, t_type, real_files, caption)
             published.append(t_id)
             current_batch_ids.discard(t_id)
-            lock_native_session_in_memory(cl)
+            save_valid_session(cl)
             save_published_list(published)
             clear_safety_cooldown()
 
@@ -1262,7 +1125,13 @@ def run_insta_publish_cycle(published):
             err_u = str(e)
             print(f"Upload error on {t_type}:", err_u)
             err_low = err_u.lower()
-            if any(k in err_low for k in ["inactive", "challenge", "feedback_required", "spam", "checkpoint", "wait a few minutes"]):
+            if "login_required" in err_low:
+                activate_safety_cooldown(hours=6, reason=err_u)
+                notify_backup_bot(
+                    "⚠️ <b>سشن اینستاگرام نیاز به تجدید دارد.</b>\n"
+                    "لطفاً در پنجره Incognito مرورگر با Passkey یا واتس‌اپ وارد شوید و کد <code>sessionid</code> جدید را در همین چت بفرستید."
+                )
+            elif any(k in err_low for k in ["inactive", "challenge", "feedback_required", "spam", "checkpoint", "wait a few minutes"]):
                 activate_safety_cooldown(hours=3, reason=err_u)
                 notify_admin(
                     f"🛡 <b>محافظ هوشمند پیج فعال شد!</b>\n"
@@ -1276,7 +1145,7 @@ def run_insta_publish_cycle(published):
 
 
 def main():
-    global KEEP_RUNNING, FORCE_RELOGIN_REQUESTED
+    global KEEP_RUNNING
     refresh_public_data()
     published = load_published_list()
 
@@ -1298,12 +1167,9 @@ def main():
     if IS_MANUAL_RUN and backup_bot:
         pending_now = get_current_pending_tasks(published)
         notify_backup_bot(
-            f"✅ <b>ربات @newswriting1_bot و شبیه‌ساز گوشی اندروید آماده است!</b>\n"
+            f"✅ <b>ربات @newswriting1_bot متصل شد و ۲۴ ساعته آماده پاسخگویی است!</b>\n"
             f"📦 تعداد فایل‌های فعلی در صف: <b>{to_persian_num(len(pending_now))} مورد</b>"
         )
-
-    if not os.path.exists(SESSION_FILE):
-        force_android_phone_login()
 
     print("Starting 24-Minute Active Loop...")
     start_loop_ts = time.time()
@@ -1311,15 +1177,6 @@ def main():
     force_first_manual = IS_MANUAL_RUN
 
     while (time.time() - start_loop_ts) < LOOP_DURATION_SECONDS:
-        if FORCE_RELOGIN_REQUESTED:
-            FORCE_RELOGIN_REQUESTED = False
-            if os.path.exists(SESSION_FILE):
-                try:
-                    os.remove(SESSION_FILE)
-                except Exception:
-                    pass
-            force_android_phone_login()
-
         if (time.time() - last_git_sync_ts) >= 180:
             refresh_public_data()
             last_git_sync_ts = time.time()
