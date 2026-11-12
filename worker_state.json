@@ -3,8 +3,8 @@
   "sleep_start_hour": 0,
   "sleep_end_hour": 7,
   "backup_chat_id": "30956754",
-  "backup_last_update_id": 603239738,
-  "last_insta_publish_ts": 1794478108.4614599,
+  "backup_last_update_id": 603239742,
+  "last_insta_publish_ts": 1794481756.7051747,
   "last_env_sid_hash": "277164f1fca7304c829fd68eb4ea1716",
   "active_sessionid": "56014548029:zPlb4FlPcl2dlE:4:AYlN_X_NZPMQPckI3pNm2aDWkLvw_gsDSVYTzr5xEw",
   "vip_task_ids": [],
@@ -12,7 +12,7 @@
   "custom_captions": {},
   "daily_stats": {
     "date": "۲۰۲۶/۱۱/۱۲",
-    "reels": 1,
+    "reels": 2,
     "stories": 9,
     "posts": 1
   },
