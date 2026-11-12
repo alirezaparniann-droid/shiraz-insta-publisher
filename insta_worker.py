@@ -64,7 +64,6 @@ LOOP_DURATION_SECONDS = 24 * 60
 STATE_LOCK = threading.Lock()
 GIT_LOCK = threading.Lock()
 KEEP_RUNNING = True
-# متغیر دریافت لحظه‌ای کد ۶ رقمی ایمیل از ربات @newswriting1_bot
 TELEGRAM_CHALLENGE_CODE = None
 FORCE_RELOGIN_REQUESTED = False
 
@@ -223,7 +222,7 @@ def notify_backup_bot(msg, with_kb=True):
 
 
 # ==========================================
-# ۲. شبیه‌ساز واقعی گوشی اندروید و ورود مستقیم موبایلی
+# ۲. شبیه‌ساز واقعی گوشی اندروید (رفع کامل خطای Out of Date)
 # ==========================================
 def is_in_safety_cooldown():
     st = load_worker_state()
@@ -250,28 +249,58 @@ def clear_safety_cooldown():
         save_worker_state(st)
 
 
-# پچ باگ کلید رمزنگاری پسورد در سرور گیت‌هاب
+# دریافت کلید رمزنگاری نسخه ۴ (#PWD_INSTAGRAM:4) با هدرهای رسمی اندروید
 _orig_password_encrypt = getattr(Client, "password_encrypt", None)
 
 
 def _safe_password_encrypt(self, password):
     try:
-        for ep in [
-            "https://i.instagram.com/api/v1/si/fetch_headers/?challenge_type=signup",
-            "https://i.instagram.com/api/v1/qe/sync/",
+        hdrs = getattr(self, "base_headers", None) or {
+            "User-Agent": getattr(
+                self,
+                "user_agent",
+                "Instagram 317.0.0.34.109 Android (34/14; 480dpi; 1080x2400; Samsung; SM-S918B; dm3q; qcom; en_US; 562021275)"
+            ),
+            "X-IG-App-ID": "567067343352427",
+            "X-IG-Capabilities": "3brTv10=",
+            "Accept-Language": "en-US",
+        }
+        # ۱. بررسی هدرهای آخرین پاسخ دریافتی از سرور موبایل
+        last_resp = getattr(self, "last_response", None)
+        if last_resp is not None and hasattr(last_resp, "headers"):
+            kid = last_resp.headers.get("ig-set-password-encryption-key-id")
+            pub = last_resp.headers.get("ig-set-password-encryption-pub-key")
+            if kid and pub and str(kid).strip().isdigit():
+                self.password_publickeys = lambda k=int(str(kid).strip()), p=pub.strip(): (k, p)
+                if _orig_password_encrypt:
+                    return _orig_password_encrypt(self, password)
+
+        # ۲. دریافت کلید رمزنگاری RSA با ارسال هدرهای واقعی اپلیکیشن اندروید
+        uid_val = getattr(self, "uuid", None) or getattr(self, "phone_id", None) or ""
+        for method, ep, payload in [
+            ("POST", "https://i.instagram.com/api/v1/qe/sync/", {"id": uid_val, "experiments": ""}),
+            ("POST", "https://i.instagram.com/api/v1/launcher/sync/", {"id": uid_val}),
+            ("GET", "https://i.instagram.com/api/v1/zr/token/result/", None),
+            ("GET", "https://i.instagram.com/api/v1/si/fetch_headers/?challenge_type=signup", None),
         ]:
             try:
-                r = self.private.get(ep, timeout=10)
+                if method == "POST":
+                    r = self.private.post(ep, data=payload, headers=hdrs, timeout=10)
+                else:
+                    r = self.private.get(ep, headers=hdrs, timeout=10)
                 kid = r.headers.get("ig-set-password-encryption-key-id")
                 pub = r.headers.get("ig-set-password-encryption-pub-key")
                 if kid is not None and pub is not None and str(kid).strip().isdigit():
-                    self.password_publickeys = lambda: (int(str(kid).strip()), pub.strip())
+                    self.password_publickeys = lambda k=int(str(kid).strip()), p=pub.strip(): (k, p)
                     if _orig_password_encrypt:
                         return _orig_password_encrypt(self, password)
             except Exception:
                 pass
-    except Exception:
-        pass
+
+        if _orig_password_encrypt:
+            return _orig_password_encrypt(self, password)
+    except Exception as e:
+        print("Password encrypt notice:", e)
     return f"#PWD_INSTAGRAM:0:{int(time.time())}:{password}"
 
 
@@ -294,7 +323,6 @@ def _locked_send_private_request(self, endpoint, *args, **kwargs):
     try:
         return _orig_send_private_request(self, endpoint, *args, **kwargs)
     finally:
-        # اگر در حین آپلود توکن جدیدی از طرف سرور اندروید آمد آن را به‌روز کن، ولی اگر خالی شد توکن قبلی را نگه دار
         cur_auth = getattr(self, "authorization_data", None) or {}
         if cur_auth.get("ds_user_id") and cur_auth.get("sessionid"):
             self._native_android_auth = dict(cur_auth)
@@ -310,7 +338,7 @@ if _orig_send_private_request:
 
 
 def configure_android_phone_identity(cl):
-    """تثبیت هویت سخت‌افزاری یک گوشی اندروید ثابت با منطقه زمانی تهران"""
+    """تثبیت هویت سخت‌افزاری گوشی اندروید با حفظ کامل نسخه جدید اپلیکیشن"""
     cl.delay_range = [3, 7]
     cl.country = "IR"
     cl.country_code = 98
@@ -332,9 +360,44 @@ def configure_android_phone_identity(cl):
         pass
 
 
-def lock_native_session_in_memory(cl):
-    """قفل کردن توکن واقعی اندروید در حافظه و ذخیره در فایل"""
+def has_active_mobile_auth(cl):
+    """تشخیص فوری دریافت شدن توکن سشن بلافاصله پس از تایید کد ۶ رقمی"""
+    auth = getattr(cl, "authorization_data", None) or {}
+    if auth.get("ds_user_id") and auth.get("sessionid"):
+        return True
     try:
+        sid_cookie = cl.private.cookies.get("sessionid")
+        uid_cookie = cl.private.cookies.get("ds_user_id")
+        if sid_cookie and ":" in str(sid_cookie):
+            clean_sid = urllib.parse.unquote(str(sid_cookie).strip())
+            uid_str = str(uid_cookie or clean_sid.split(":")[0]).strip()
+            cl.authorization_data = {
+                "ds_user_id": uid_str,
+                "sessionid": clean_sid,
+                "should_use_header_over_cookies": True,
+            }
+            return True
+    except Exception:
+        pass
+    last_resp = getattr(cl, "last_response", None)
+    if last_resp is not None and hasattr(last_resp, "headers"):
+        ig_auth = last_resp.headers.get("ig-set-authorization", "")
+        if ig_auth.startswith("Bearer IGT:2:"):
+            b64_part = ig_auth.split("Bearer IGT:2:", 1)[1].strip()
+            try:
+                decoded = json.loads(base64.b64decode(b64_part).decode("utf-8"))
+                if decoded.get("sessionid"):
+                    cl.authorization_data = decoded
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def lock_native_session_in_memory(cl):
+    """قفل کردن توکن واقعی اندروید در حافظه و ذخیره تضمینی در insta_session.json"""
+    try:
+        has_active_mobile_auth(cl)
         settings = cl.get_settings()
         auth = cl.authorization_data or settings.get("authorization_data", {}) or {}
         if auth.get("ds_user_id") and auth.get("sessionid"):
@@ -342,7 +405,7 @@ def lock_native_session_in_memory(cl):
             b64_payload = base64.b64encode(
                 json.dumps(auth, separators=(",", ":")).encode("utf-8")
             ).decode("utf-8")
-            bearer_str = self.private.headers.get("Authorization") if hasattr(cl, "private") else None
+            bearer_str = cl.private.headers.get("Authorization") if hasattr(cl, "private") else None
             if not bearer_str or not str(bearer_str).startswith("Bearer IGT:2:"):
                 bearer_str = f"Bearer IGT:2:{b64_payload}"
             cl._native_android_bearer = bearer_str
@@ -363,19 +426,18 @@ def lock_native_session_in_memory(cl):
 
 def force_android_phone_login():
     """
-    ورود ۱۰۰٪ واقعی به عنوان یک گوشی اندروید با نام کاربری و رمز عبور
-    به همراه دریافت هوشمند کد ۶ رقمی از چت ربات دوم (@newswriting1_bot) یا تایید It's me
+    ورود مستقیم شبیه‌ساز گوشی اندروید با نسخه جدید (بدون فراخوانی درگاه قدیمی login_legacy)
     """
     global TELEGRAM_CHALLENGE_CODE
     if not INSTA_PASS:
         notify_backup_bot(
-            "⚠️ <b>رمز عبور اینستاگرام (INSTA_PASS) در بخش Secrets گیت‌هاب تنظیم نشده است!</b>\n"
-            "لطفاً در Settings -> Secrets مقدار INSTA_PASS را وارد کنید."
+            "⚠️ <b>رمز عبور اینستاگرام (INSTA_PASS) در بخش Secrets گیت‌هاب تنظیم نشده است!</b>"
         )
         return None
 
     cl = Client()
     configure_android_phone_identity(cl)
+    cl.init()
 
     def interactive_telegram_code_handler(username, choice=None):
         global TELEGRAM_CHALLENGE_CODE
@@ -383,67 +445,68 @@ def force_android_phone_login():
         notify_backup_bot(
             f"📲 <b>شبیه‌ساز گوشی اندروید در حال ورود به پیج <code>@{INSTA_USER}</code> است!</b>\n\n"
             f"🔐 اینستاگرام یک <b>کد تایید ۶ رقمی ({choice})</b> به ایمیل یا پیامک شما ارسال کرده است.\n"
-            f"👈 <b>لطفاً همین الان (ظرف ۲ دقیقه) آن کد ۶ رقمی را در همین چت (@newswriting1_bot) بفرستید</b> تا ربات درجا وارد شود:"
+            f"👈 <b>لطفاً همین الان (ظرف ۳ دقیقه) آن کد ۶ رقمی را در همین چت (@newswriting1_bot) بفرستید</b> تا ورود تکمیل شود:"
         )
         wait_start = time.time()
-        while (time.time() - wait_start) < 120:
+        while (time.time() - wait_start) < 180:
             if TELEGRAM_CHALLENGE_CODE:
                 code_str = str(TELEGRAM_CHALLENGE_CODE).strip()
                 TELEGRAM_CHALLENGE_CODE = None
-                notify_backup_bot(f"✅ کد <code>{code_str}</code> دریافت شد! در حال ثبت ورود گوشی اندروید...")
+                notify_backup_bot(f"✅ کد <code>{code_str}</code> دریافت شد! در حال ثبت و قفل کردن نشست اندروید...")
                 return code_str
-            time.sleep(1.5)
+            time.sleep(1.2)
 
-        fallback_c = CHALLENGE_CODE_ENV or "807231"
-        return fallback_c
+        return CHALLENGE_CODE_ENV or "807231"
 
     cl.challenge_code_handler = interactive_telegram_code_handler
 
     try:
-        print(f"Simulating Android phone login for @{INSTA_USER}...")
-        try:
-            cl.login(INSTA_USER, INSTA_PASS)
-        except Exception as e_caa:
-            if hasattr(cl, "login_legacy"):
-                print("Switching to Android login_legacy:", e_caa)
-                cl.login_legacy(INSTA_USER, INSTA_PASS)
-            else:
-                raise e_caa
-
-        lock_native_session_in_memory(cl)
-        notify_backup_bot(
-            "✅ <b>شبیه‌ساز گوشی اندروید با موفقیت وارد اینستاگرام شد!</b>\n"
-            "🔒 نشست واقعی موبایل در <code>insta_session.json</code> قفل و ذخیره گردید و دیگر نیازی به لاگین مجدد نیست."
-        )
-        return cl
-
+        print(f"Simulating modern Android login for @{INSTA_USER}...")
+        cl.login(INSTA_USER, INSTA_PASS)
+        if lock_native_session_in_memory(cl):
+            notify_backup_bot(
+                "✅ <b>شبیه‌ساز گوشی اندروید با موفقیت وارد اینستاگرام شد!</b>\n"
+                "🔒 نشست واقعی موبایل در <code>insta_session.json</code> قفل و ذخیره گردید و دیگر نیازی به لاگین مجدد نیست."
+            )
+            return cl
     except Exception as e1:
+        # اگر کد ۶ رقمی تایید شده و توکن سشن دریافت شده باشد، بلافاصله آن را ذخیره کن
+        if has_active_mobile_auth(cl) and lock_native_session_in_memory(cl):
+            notify_backup_bot(
+                "✅ <b>کد ۶ رقمی تایید شد و نشست شبیه‌ساز گوشی اندروید با موفقیت قفل و ذخیره گردید!</b>"
+            )
+            return cl
+
         err1 = str(e1)
         print("First Android login attempt notice:", err1)
         notify_backup_bot(
-            f"📲 <b>درخواست ورود گوشی اندروید به اینستاگرام ارسال شد!</b>\n"
-            f"پیام سرور: <code>{html.escape(err1[:200])}</code>\n\n"
-            f"👈 <b>همین الان اپلیکیشن اینستاگرام را در گوشی خود باز کنید و اگر اعلان «It's me / این من بودم» آمده، روی آن بزنید.</b>\n"
-            f"⏳ ربات ۶۰ ثانیه با همین شناسه گوشی منتظر تایید شما می‌ماند و سپس خودکار وارد می‌شود..."
+            f"📲 <b>درخواست ورود گوشی اندروید ارسال شد!</b>\n"
+            f"پیام سرور: <code>{html.escape(err1[:220])}</code>\n\n"
+            f"👈 <b>اگر در اپلیکیشن اینستاگرام روی گوشی اعلان «It's me / این من بودم» آمده، همین الان روی آن بزنید.</b>\n"
+            f"⏳ ربات ۶۰ ثانیه منتظر تایید شما می‌ماند و سپس با همان شناسه گوشی وارد می‌شود..."
         )
         time.sleep(60)
 
         try:
-            if hasattr(cl, "login_legacy"):
-                cl.login_legacy(INSTA_USER, INSTA_PASS)
-            else:
-                cl.login(INSTA_USER, INSTA_PASS)
-            lock_native_session_in_memory(cl)
-            notify_backup_bot(
-                "✅ <b>ورود شبیه‌ساز گوشی اندروید پس از تایید شما با موفقیت قفل و ذخیره شد!</b>"
-            )
-            return cl
+            cl.login(INSTA_USER, INSTA_PASS)
+            if lock_native_session_in_memory(cl):
+                notify_backup_bot(
+                    "✅ <b>ورود شبیه‌ساز گوشی اندروید پس از تایید شما با موفقیت قفل و ذخیره شد!</b>"
+                )
+                return cl
         except Exception as e2:
+            if has_active_mobile_auth(cl) and lock_native_session_in_memory(cl):
+                notify_backup_bot(
+                    "✅ <b>نشست شبیه‌ساز گوشی اندروید با موفقیت دریافت و ذخیره شد!</b>"
+                )
+                return cl
             notify_backup_bot(
                 f"⚠️ <b>ورود گوشی اندروید کامل نشد:</b>\n<code>{html.escape(str(e2)[:300])}</code>\n\n"
                 f"💡 <i>هر زمان آماده بودید، دکمه «🔐 ورود مجدد گوشی اندروید» را در کیبورد پایین بزنید.</i>"
             )
             return None
+
+    return cl if has_active_mobile_auth(cl) else None
 
 
 def get_insta_client(force_relogin=False):
@@ -452,7 +515,6 @@ def get_insta_client(force_relogin=False):
         try:
             saved_data = json.load(open(SESSION_FILE, "r", encoding="utf-8"))
             saved_auth = saved_data.get("authorization_data", {}) or {}
-            # فقط اگر سشن واقعی موبایلی دارای ds_user_id و sessionid باشد بارگذاری کن
             if saved_auth.get("ds_user_id") and saved_auth.get("sessionid"):
                 cl = Client()
                 configure_android_phone_identity(cl)
@@ -822,7 +884,7 @@ def process_single_telegram_update(u, published):
             st["backup_chat_id"] = cid
             save_worker_state(st)
 
-        # تشخیص فوری کد ۶ رقمی ایمیل/پیامک اینستاگرام (با اعداد فارسی یا انگلیسی)
+        # تشخیص فوری کد ۶ رقمی ایمیل/پیامک اینستاگرام
         digits_only = raw_txt.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")).strip()
         if re.fullmatch(r"\d{6}", digits_only):
             TELEGRAM_CHALLENGE_CODE = digits_only
@@ -834,7 +896,7 @@ def process_single_telegram_update(u, published):
             listener_bot.send_message(
                 cid,
                 "📱 <b>فرمان ورود با شبیه‌ساز گوشی اندروید صادر شد!</b>\n"
-                "تا چند ثانیه دیگر فرآیند ورود آغاز می‌شود؛ اگر کد ایمیل یا اعلان It's me آمد آماده تایید باشید.",
+                "تا چند ثانیه دیگر فرآیند ورود آغاز می‌شود؛ اگر کد ۶ رقمی به ایمیلتان آمد، همان عدد را در همین چت بفرستید.",
                 parse_mode="HTML"
             )
             return
@@ -1108,7 +1170,6 @@ def run_insta_publish_cycle(published):
     refresh_public_data()
     pending_tasks = get_current_pending_tasks(published)
 
-    # اگر هنوز سشن اندروید ساخته نشده، حتی در صورت خالی بودن صف ابتدا وارد شو تا سشن قفل شود
     if not os.path.exists(SESSION_FILE):
         cl = get_insta_client(force_relogin=True)
         if not cl or not pending_tasks:
@@ -1241,7 +1302,6 @@ def main():
             f"📦 تعداد فایل‌های فعلی در صف: <b>{to_persian_num(len(pending_now))} مورد</b>"
         )
 
-    # اگر فایل سشن اندروید وجود ندارد، در همان ابتدای اجرا لاگین اندروید را انجام بده
     if not os.path.exists(SESSION_FILE):
         force_android_phone_login()
 
