@@ -51,8 +51,12 @@ jobs:
 
       - name: Install Libraries (Fast Mode)
         run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout="10" update || true
+            sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout="10" install -y ffmpeg || true
+          fi
           pip install --upgrade pip
-          pip install --upgrade pyTelegramBotAPI requests Pillow instagrapi moviepy imageio-ffmpeg
+          pip install pyTelegramBotAPI requests "Pillow<11.0.0" instagrapi "moviepy==1.0.3" " decorator<5.0.0" imageio-ffmpeg
 
       - name: Run Instagram Worker (Always-On)
         env:
