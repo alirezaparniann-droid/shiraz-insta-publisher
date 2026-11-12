@@ -11,7 +11,9 @@ import hashlib
 import threading
 import subprocess
 import urllib.parse
+from pathlib import Path
 from datetime import datetime, timedelta
+from PIL import Image
 import telebot
 from telebot import apihelper
 from telebot.types import (
@@ -22,6 +24,10 @@ from telebot.types import (
     InlineKeyboardButton
 )
 from instagrapi import Client
+
+# ۱. پچ سازگاری Pillow برای جلوگیری از خطای moviepy هنگام آپلود Reels
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = getattr(Image, "Resampling", Image).LANCZOS
 
 # جلوگیری قطعی از فریز شدن سوکت تلگرام
 apihelper.CONNECT_TIMEOUT = 10
@@ -34,7 +40,7 @@ except Exception:
     HAS_STORY_POLL = False
 
 # ==========================================
-# ۱. تنظیمات پایه و توکن‌ها (نسخه نهایی پایدار بدون لاگین مجدد)
+# ۱. تنظیمات پایه و توکن‌ها (حفظ کامل اتصال و سشن قفل‌شده)
 # ==========================================
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 BACKUP_BOT_TOKEN = os.environ.get("BACKUP_BOT_TOKEN", "").strip()
@@ -64,7 +70,7 @@ STATE_LOCK = threading.Lock()
 GIT_LOCK = threading.Lock()
 KEEP_RUNNING = True
 
-# ربات اول (@shirazlastnews_bot): فقط برای گزارش‌های انتشار اینستاگرام
+# ربات اول (@shirazlastnews_bot): مخصوص گزارش‌های انتشار اینستاگرام
 bot = telebot.TeleBot(TOKEN, threaded=False) if TOKEN else None
 # دو کلاینت مجزا برای ربات دوم (@newswriting1_bot) جهت پاسخگویی آنی ۲۴ ساعته
 backup_bot = telebot.TeleBot(BACKUP_BOT_TOKEN, threaded=False) if BACKUP_BOT_TOKEN else bot
@@ -218,8 +224,52 @@ def notify_backup_bot(msg, with_kb=True):
 
 
 # ==========================================
-# ۲. مدیریت پایدار سشن بدون ارسال درخواست لاگین (صفر درصد حساسیت)
+# ۲. پچ حذف خطای 404 (qe/expose) و قفل دائمی هدر و کوکی سشن
 # ==========================================
+# غیرفعال کردن مستقیم متد منقضی‌شده expose در کتابخانه instagrapi
+Client.expose = lambda self, *args, **kwargs: {"status": "ok"}
+
+_orig_send_private_request = getattr(Client, "_send_private_request", None)
+
+
+def _patched_send_private_request(self, endpoint, *args, **kwargs):
+    ep_str = str(endpoint).strip()
+    # جلوگیری از ارسال درخواست به آدرس حذف‌شده qe/expose/ که باعث خطای 404 می‌شد
+    if "qe/expose" in ep_str or "launcher/sync" in ep_str:
+        return {"status": "ok"}
+
+    locked_bearer = getattr(self, "_locked_bearer_str", None)
+    locked_auth = getattr(self, "_locked_auth_dict", None)
+    locked_sid = getattr(self, "_locked_sid_str", None)
+    locked_uid = getattr(self, "_locked_uid_str", None)
+
+    if locked_bearer and locked_auth:
+        self.authorization_data = dict(locked_auth)
+        self.private.headers["Authorization"] = locked_bearer
+        if locked_sid and locked_uid:
+            self.private.cookies.set("sessionid", locked_sid, domain=".instagram.com")
+            self.private.cookies.set("ds_user_id", locked_uid, domain=".instagram.com")
+
+    try:
+        return _orig_send_private_request(self, endpoint, *args, **kwargs)
+    except Exception as exc:
+        # اگر هر آدرس فرعی همگام‌سازی خطای 404 داد، مانع توقف آپلود شو
+        if "404" in str(exc) and any(x in ep_str for x in ["qe/", "zr/", "launcher/", " attribution"]):
+            return {"status": "ok"}
+        raise exc
+    finally:
+        # حفظ قفل سشن در صورت ارسال هدر خالی توسط اینستاگرام بعد از آپلود
+        if locked_bearer and locked_auth:
+            cur_auth = getattr(self, "authorization_data", None) or {}
+            if not cur_auth.get("sessionid"):
+                self.authorization_data = dict(locked_auth)
+                self.private.headers["Authorization"] = locked_bearer
+
+
+if _orig_send_private_request:
+    Client._send_private_request = _patched_send_private_request
+
+
 def is_in_safety_cooldown():
     st = load_worker_state()
     until_ts = st.get("cooldown_until", 0)
@@ -293,6 +343,11 @@ def inject_mobile_sessionid(cl, sid_input):
     cl.set_settings(settings)
     cl.init()
 
+    cl._locked_sid_str = raw_colon_sid
+    cl._locked_uid_str = uid_str
+    cl._locked_auth_dict = dict(auth_dict)
+    cl._locked_bearer_str = bearer_str
+
     cl.authorization_data = dict(auth_dict)
     cl.private.headers.update({"Authorization": bearer_str})
     cl.private.cookies.set("sessionid", raw_colon_sid, domain=".instagram.com")
@@ -303,11 +358,14 @@ def inject_mobile_sessionid(cl, sid_input):
 def save_valid_session(cl, fallback_sid=""):
     try:
         settings = cl.get_settings()
+        locked_auth = getattr(cl, "_locked_auth_dict", None) or {}
         auth = cl.authorization_data or settings.get("authorization_data", {}) or {}
         st = load_worker_state()
 
         raw_sid = (
             fallback_sid
+            or getattr(cl, "_locked_sid_str", "")
+            or locked_auth.get("sessionid", "")
             or auth.get("sessionid", "")
             or st.get("active_sessionid", "")
             or RAW_SID
@@ -340,14 +398,11 @@ def save_valid_session(cl, fallback_sid=""):
 
 
 def get_insta_client():
-    """
-    بارگذاری بی‌صدا و ایمن سشن (بدون فراخوانی cl.login و بدون ایجاد اعلان It's me)
-    """
+    """بارگذاری بی‌صدا و ایمن سشن قفل‌شده"""
     st = load_worker_state()
     clean_env_sid = urllib.parse.unquote(RAW_SID.strip()).strip('"').strip("'").strip() if RAW_SID else ""
     env_hash = hashlib.md5(clean_env_sid.encode("utf-8")).hexdigest() if clean_env_sid else ""
 
-    # اگر کاربر سشن جدیدی در IG_SESSIONID گیت‌هاب گذاشته، خودکار جایگزین سشن قبلی کن
     if clean_env_sid and ":" in clean_env_sid and env_hash != st.get("last_env_sid_hash"):
         print("New IG_SESSIONID detected in Secrets! Updating session automatically...")
         cl = Client()
@@ -360,7 +415,6 @@ def get_insta_client():
             clear_safety_cooldown()
             return cl
 
-    # ۱. استفاده از سشن ذخیره‌شده فعلی
     if os.path.exists(SESSION_FILE):
         try:
             saved_data = json.load(open(SESSION_FILE, "r", encoding="utf-8"))
@@ -382,20 +436,12 @@ def get_insta_client():
                     cl.load_settings(SESSION_FILE, override_app_version=True)
                 except TypeError:
                     cl.load_settings(SESSION_FILE)
-                cl.init()
-
-                uid_str = saved_sid.split(":")[0].strip()
-                auth_dict, bearer_str = build_igt_bearer_header(uid_str, saved_sid)
-                cl.authorization_data = auth_dict
-                cl.private.headers.update({"Authorization": bearer_str})
-                cl.private.cookies.set("sessionid", saved_sid, domain=".instagram.com")
-                cl.private.cookies.set("ds_user_id", uid_str, domain=".instagram.com")
-                print(f"Loaded existing session silently (user_id={uid_str})!")
-                return cl
+                if inject_mobile_sessionid(cl, saved_sid):
+                    print(f"Loaded existing locked session silently (user_id={cl._locked_uid_str})!")
+                    return cl
         except Exception as e:
             print("Warning loading saved session:", e)
 
-    # ۲. استفاده از سشن ثبت‌شده در تلگرام یا IG_SESSIONID
     fallback_sid = st.get("active_sessionid") or clean_env_sid
     if fallback_sid and ":" in fallback_sid:
         try:
@@ -410,15 +456,14 @@ def get_insta_client():
 
     notify_backup_bot(
         "⚠️ <b>سشن فعال اینستاگرام یافت نشد.</b>\n"
-        "برای جلوگیری از حساسیت پیج، لاگین با رمز عبور خاموش است.\n"
-        "لطفاً در پنجره Incognito مرورگر (با Passkey یا واتس‌اپ) وارد شوید و کد <code>sessionid</code> را با دستور زیر در همین چت بفرستید:\n"
+        "لطفاً کد <code>sessionid</code> را با دستور زیر در همین چت بفرستید:\n"
         "<code>سشن: کد_سشن_شما</code>"
     )
     return None
 
 
 # ==========================================
-# ۳. توابع آپلود مدیا (حذف تله configure_to_sidecar برای جلوگیری از پریدن سشن)
+# ۳. توابع آپلود مدیا (استانداردسازی کامل برای Reels، Story و Post)
 # ==========================================
 def get_task_priority(task_type):
     t = str(task_type).lower().strip()
@@ -432,11 +477,16 @@ def get_task_priority(task_type):
 
 
 def make_clean_cover_thumb(video_path):
-    thumb_path = video_path + "_cover.jpg"
+    thumb_path = str(video_path) + "_cover.jpg"
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-i", video_path, "-ss", "00:00:02.0", "-vframes", "1", thumb_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15
+            [
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-ss", "00:00:01.5", "-vframes", "1",
+                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+                thumb_path
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20
         )
         if os.path.exists(thumb_path):
             return thumb_path
@@ -445,10 +495,34 @@ def make_clean_cover_thumb(video_path):
     return None
 
 
+def ensure_reel_compatible_video(video_path):
+    """تضمین استاندارد بودن کدک تصویر و صدای ویدیو برای بخش Reels اینستاگرام"""
+    fixed_path = str(video_path) + "_reel_ready.mp4"
+    try:
+        res = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high",
+                "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k",
+                "-movflags", "+faststart",
+                fixed_path
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90
+        )
+        if res.returncode == 0 and os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 10000:
+            return fixed_path
+    except Exception as e:
+        print("Video standardize notice:", e)
+    return str(video_path)
+
+
 def execute_upload_task(cl, t_type, real_files, caption):
-    # نکته کلیدی: ارسال پست‌ها و آلبوم‌ها از درگاه امن photo_upload تا اینستاگرام هرگز سشن را باطل نکند
+    first_file = Path(real_files[0])
+
     if t_type in ("photo", "album"):
-        cl.photo_upload(real_files[0], caption=caption)
+        cl.photo_upload(first_file, caption=caption)
+
     elif t_type == "story_photo":
         if HAS_STORY_POLL:
             try:
@@ -457,21 +531,26 @@ def execute_upload_task(cl, t_type, real_files, caption):
                     question="نظر شما چیست؟",
                     tallies=[StoryTallie(text="عالیه 👍", count=0), StoryTallie(text="انتقاد دارم 👎", count=0)]
                 )
-                cl.photo_upload_to_story(real_files[0], polls=[poll])
+                cl.photo_upload_to_story(first_file, polls=[poll])
                 return
-            except Exception:
-                pass
-        cl.photo_upload_to_story(real_files[0])
+            except Exception as e_poll:
+                print("Story poll notice, uploading plain story:", e_poll)
+        cl.photo_upload_to_story(first_file)
+
     elif t_type == "story_video":
-        th = make_clean_cover_thumb(real_files[0])
-        cl.video_upload_to_story(real_files[0], thumbnail=th)
+        th = make_clean_cover_thumb(first_file)
+        th_path = Path(th) if th else None
+        cl.video_upload_to_story(first_file, thumbnail=th_path)
+
     elif t_type in ("reel", "video"):
-        th = make_clean_cover_thumb(real_files[0])
+        ready_vid = Path(ensure_reel_compatible_video(first_file))
+        th = make_clean_cover_thumb(ready_vid)
+        th_path = Path(th) if th else None
         try:
-            cl.clip_upload(real_files[0], caption=caption, thumbnail=th)
+            cl.clip_upload(ready_vid, caption=caption, thumbnail=th_path)
         except Exception as e_clip:
             print("clip_upload notice, falling back to video_upload:", e_clip)
-            cl.video_upload(real_files[0], caption=caption, thumbnail=th)
+            cl.video_upload(ready_vid, caption=caption, thumbnail=th_path)
 
 
 def get_current_pending_tasks(published):
@@ -763,7 +842,6 @@ def process_single_telegram_update(u, published):
             st["backup_chat_id"] = cid
             save_worker_state(st)
 
-        # امکان ثبت مستقیم سشن جدید از داخل چت تلگرام (حتی اگر بدون پیشوند «سشن:» فرستاده شود)
         if raw_txt.startswith("سشن:") or raw_txt.startswith("/session") or ("56014548029" in raw_txt and (":" in raw_txt or "%3A" in raw_txt)):
             raw_sid = raw_txt.replace("سشن:", "").replace("/session", "").strip()
             cl_test = Client()
@@ -775,8 +853,7 @@ def process_single_telegram_update(u, published):
                 clear_safety_cooldown()
                 listener_bot.send_message(
                     cid,
-                    "✅ <b>سشن جدید اینستاگرام با موفقیت ثبت و قفل شد!</b>\n"
-                    "از این لحظه آپلود استوری، ریلز و پست‌ها بدون هیچ قطعی ادامه می‌یابد.",
+                    "✅ <b>سشن جدید اینستاگرام با موفقیت ثبت و قفل شد!</b>",
                     parse_mode="HTML",
                     reply_markup=get_backup_kb(st.get("auto_upload_enabled", True))
                 )
@@ -1129,7 +1206,7 @@ def run_insta_publish_cycle(published):
                 activate_safety_cooldown(hours=6, reason=err_u)
                 notify_backup_bot(
                     "⚠️ <b>سشن اینستاگرام نیاز به تجدید دارد.</b>\n"
-                    "لطفاً در پنجره Incognito مرورگر با Passkey یا واتس‌اپ وارد شوید و کد <code>sessionid</code> جدید را در همین چت بفرستید."
+                    "لطفاً در پنجره Incognito مرورگر وارد شوید و کد <code>sessionid</code> جدید را در همین چت بفرستید."
                 )
             elif any(k in err_low for k in ["inactive", "challenge", "feedback_required", "spam", "checkpoint", "wait a few minutes"]):
                 activate_safety_cooldown(hours=3, reason=err_u)
@@ -1167,7 +1244,7 @@ def main():
     if IS_MANUAL_RUN and backup_bot:
         pending_now = get_current_pending_tasks(published)
         notify_backup_bot(
-            f"✅ <b>ربات @newswriting1_bot متصل شد و ۲۴ ساعته آماده پاسخگویی است!</b>\n"
+            f"✅ <b>ربات @newswriting1_bot متصل شد و با پچ ضد 404 آماده آپلود است!</b>\n"
             f"📦 تعداد فایل‌های فعلی در صف: <b>{to_persian_num(len(pending_now))} مورد</b>"
         )
 
