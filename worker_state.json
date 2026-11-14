@@ -1,10 +1,10 @@
 {
-  "auto_upload_enabled": true,
+  "auto_upload_enabled": false,
   "sleep_start_hour": 0,
   "sleep_end_hour": 7,
   "backup_chat_id": "30956754",
-  "backup_last_update_id": 603239990,
-  "last_insta_publish_ts": 1794659677.5141034,
+  "backup_last_update_id": 603239992,
+  "last_insta_publish_ts": 1794663094.7558799,
   "last_env_sid_hash": "902081ed09bd84562bfbfb004dcb1f4e",
   "active_sessionid": "56014548029:Ui5YdbtvWkuj1l:9:AYlM157BzhCxAToqT9zNYbTI2lW3wnK93vBkEctvEQ",
   "vip_task_ids": [],
